@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# Pre-git manual backups of poll_review.py / test_poll_review.py. Kept on
+# disk but out of the repo: git is the backup now, and a committed .bak is
+# just a second copy that drifts.
+*.bak
