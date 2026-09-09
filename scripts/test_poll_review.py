@@ -874,4 +874,70 @@ with_urlopen(capture)
 assert seen[0].endswith(f"/state/owner/name/4?sha={HEAD}"), seen[0]
 print("  ok  builds /state/{owner}/{repo}/{pr}?sha=")
 
+print("api retries:")
+
+
+def with_api_transport(fake):
+    """Run api() against a stubbed urlopen with sleeps recorded, not slept.
+
+    Every other test stubs api() itself, so the retry loop inside it is
+    reachable only here. Returns (result-or-exception, sleeps)."""
+    real_open = poll_review.urllib.request.urlopen
+    real_sleep = poll_review.time.sleep
+    sleeps: list[float] = []
+    poll_review.urllib.request.urlopen = fake
+    poll_review.time.sleep = sleeps.append
+    try:
+        try:
+            return poll_review.api("/x", "t"), sleeps
+        except Exception as exc:  # the caller asserts on the type
+            return exc, sleeps
+    finally:
+        poll_review.urllib.request.urlopen = real_open
+        poll_review.time.sleep = real_sleep
+
+
+def flaky(failures: list, then: bytes):
+    """Raise each entry of `failures` in turn, then answer with `then`."""
+    queue = list(failures)
+
+    def fake(req, timeout=None):
+        if queue:
+            raise queue.pop(0)
+        return _FakeResponse(then)
+
+    return fake
+
+
+# One bad read out of ~seventy must not end the wait -- milex-scopeline#26
+# died twice to a single TimeoutError on /pulls/N/reviews.
+got, sleeps = with_api_transport(flaky([TimeoutError()], b'{"ok":1}'))
+check("a timeout is retried and the next read answers", got, {"ok": 1})
+check("  backed off once before it", sleeps, [poll_review.API_RETRY_BACKOFF])
+
+got, sleeps = with_api_transport(
+    flaky([urllib.error.HTTPError("u", 502, "Bad Gateway", {}, None)], b"[]")
+)
+check("a 5xx is retried", got, [])
+
+# urlopen wraps a refused connection in URLError; that is the shape to retry.
+got, sleeps = with_api_transport(
+    flaky([urllib.error.URLError("refused")] * 5, b"[]")
+)
+assert isinstance(got, urllib.error.URLError), f"expected the last error, got {got!r}"
+check(
+    "gives up after API_RETRIES with the last error",
+    len(sleeps),
+    poll_review.API_RETRIES - 1,
+)
+check("  backoff grows with the attempt", sleeps, [2.0, 4.0])
+
+# A 4xx is an answer -- the wrong token, the wrong repo -- and retrying it only
+# delays the report of a real problem.
+got, sleeps = with_api_transport(
+    flaky([urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)], b"[]")
+)
+assert isinstance(got, urllib.error.HTTPError) and got.code == 401, got
+check("a 401 is raised at once, not retried", sleeps, [])
+
 print("\nall passed")

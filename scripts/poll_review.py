@@ -496,13 +496,40 @@ def token() -> str:
     sys.exit(f"no token: found no 'token:' line in {TEA_CONFIG}")
 
 
+# A poller waits up to 35 minutes and makes a call every 30 seconds, so it takes on the
+# order of seventy chances to meet one bad read. Meeting one used to end the whole wait:
+# `urlopen` raises `TimeoutError` out of `api`, nothing catches it, and the traceback lands
+# where a verdict should be -- twice in one session on milex-scopeline#26, both times on
+# `/pulls/N/reviews`, both times with the review still pending. That is the same false
+# all-clear the TIMED_OUT rule exists to prevent, wearing a stack trace: the wait is over
+# and nothing decided.
+#
+# Only transport failures and 5xx are retried. A 401, a 404 or any other 4xx is an answer --
+# the wrong token, the wrong repo -- and retrying it just delays the report of a real
+# problem by three sleeps.
+API_RETRIES = 3
+API_RETRY_BACKOFF = 2.0
+
+
 def api(path: str, tok: str):
     req = urllib.request.Request(
         f"{BASE_URL}/api/v1{path}",
         headers={"Authorization": f"token {tok}", "Accept": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+    last: Exception | None = None
+    for attempt in range(API_RETRIES):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                raise
+            last = exc
+        except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
+            last = exc
+        if attempt < API_RETRIES - 1:
+            time.sleep(API_RETRY_BACKOFF * (attempt + 1))
+    raise last if last else RuntimeError(f"api({path}) failed with no error recorded")
 
 
 PAGE_LIMIT = 50

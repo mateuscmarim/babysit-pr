@@ -33,6 +33,14 @@ Two environment variables point it at the agent's state endpoint:
 Neither is required — an agent that cannot be reached is reported as
 unreachable, and the poller falls back to reading Gitea alone.
 
+Gitea reads retry. A 35-minute wait at a 30s interval is on the order of
+seventy API calls, and one timeout used to end the whole run with a traceback
+where the verdict should be — `milex-scopeline-server#26` died that way twice
+in one session, both times on `/pulls/N/reviews` with the review still
+pending. `api()` now retries transport failures and 5xx up to `API_RETRIES`
+(3) with a growing backoff; a 4xx is an answer (wrong token, wrong repo) and
+is raised at once.
+
 The script only reads. It never merges, comments, resolves, or edits — see
 [Replying to findings](#replying-to-findings-and-resolving-threads) for the
 write contract it hands downstream.
