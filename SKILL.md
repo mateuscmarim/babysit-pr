@@ -376,9 +376,15 @@ Run `python3 scripts/test_reply_finding.py` from the scripts directory after
 any change to `reply_finding.py`.
 
 Safe to know: replies cannot corrupt the bot. `_collect_seen_keys` filters to the
-bot's own reviews, so comments by anyone else never enter its dedup set, and
-resolving a thread does not suppress a re-flag on the next push — dedup keys on
-comment body text, not thread state.
+bot's own reviews, so comments by anyone else never enter its dedup set, and a
+reply alone changes nothing on the next push. **Resolving a thread does** —
+since `gitea-review-agent#65` (2026-09-09) a resolved conversation is an
+acknowledgment: the resolution pass stops re-checking that finding, posts no
+"bad fix" on it, and still matches a reworded repeat against it so neither a
+verbatim nor a restated copy is posted again. That is the one way to tell the
+bot "won't fix", and it is why the resolve rule above matters both ways —
+resolving a disagreement does not just hide it from the PR view, it also
+silences the bot on that defect for good.
 
 ## Verified behaviour
 
