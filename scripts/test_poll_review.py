@@ -268,6 +268,61 @@ assert "tests.yml/tests" in v.detail and "eval.yml/eval" in v.detail, (
 )
 print("  ok  PASSED detail names every job across every workflow")
 
+# A skipped job is a designed outcome, not a failure. marim-harness's quality
+# gate guards baseline promotion with `github.event_name == 'push'` so a PR run
+# never holds a contents:write token; that `promote` job is therefore skipped on
+# every PR and always will be. Reading it as FAILED reported a green gate as a
+# red CI and, FAILED being terminal, bailed out before the review could land.
+v = classify_ci(
+    [
+        job("completed", "success", name="gate"),
+        job("completed", "success", name="report"),
+        job("completed", "skipped", name="promote"),
+    ],
+    NOW,
+)
+check("a skipped job among passing ones -> PASSED", v.state, "PASSED")
+assert "promote" in v.detail, "the skipped job is still named in the detail"
+assert "not gating" in v.detail, "the detail says the skipped job did not gate"
+print("  ok  skipped job named but not gating")
+
+check(
+    "'neutral' is not a failure either",
+    classify_ci(
+        [job("completed", "success", name="a"), job("completed", "neutral", name="b")],
+        NOW,
+    ).state,
+    "PASSED",
+)
+check(
+    "a skipped job does not rescue a real failure",
+    classify_ci(
+        [job("completed", "skipped", name="promote"), job("completed", "failure", name="gate")],
+        NOW,
+    ).state,
+    "FAILED",
+)
+check(
+    "a skipped job does not settle a still-running one",
+    classify_ci(
+        [job("completed", "skipped", name="promote"), job("in_progress", name="gate")],
+        NOW,
+    ).state,
+    "RUNNING",
+)
+check(
+    "'cancelled' stays FAILED -- an aborted job decided nothing",
+    classify_ci([job("completed", "cancelled")], NOW).state,
+    "FAILED",
+)
+# All-skipped must not manufacture an all-clear: no job attested to this commit.
+v = classify_ci(
+    [job("completed", "skipped", name="a"), job("completed", "skipped", name="b")], NOW
+)
+check("every job skipped -> NONE, not PASSED", v.state, "NONE")
+assert "skipped" in v.detail, "the all-skipped detail says why nothing ran"
+print("  ok  all-skipped detail explains itself")
+
 print("ci_settled:")
 
 # RUNNING is never settled, no matter how long it has been watched -- the

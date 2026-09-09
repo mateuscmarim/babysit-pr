@@ -96,9 +96,9 @@ return point:
 | state | what it means |
 |---|---|
 | `PASSED` | Every matched job completed with a successful conclusion. |
-| `FAILED` | At least one matched job completed without succeeding — which one, and its conclusion, are named in the detail line. |
+| `FAILED` | At least one matched job completed without succeeding — which one, and its conclusion, are named in the detail line. `cancelled` counts: an aborted job decided nothing, so it is not softer than a failure. `skipped` does **not** — see below. |
 | `RUNNING` | At least one matched job is still queued or in progress (with everything else already passed or nothing failed yet). Past `CI_SLOW_THRESHOLD_S` (15 minutes — set from mdbin's 6-7m and nasa-agent's 11m observed passing durations) the detail flags it as **possibly hung**, since none of these jobs set `timeout-minutes` and nothing else will ever say so. |
-| `NONE` | No run matched at this head SHA — covers both "nothing has triggered yet" and "this repo triggered nothing matching `CI_WORKFLOW_FILE`/`CI_JOB_NAME`". Indistinguishable from the jobs list, but **not** equally safe to act on, so `NONE` does not end the wait for the first 90s (`CI_NONE_GRACE_S`). |
+| `NONE` | No run matched at this head SHA — or every job that did match was skipped, so nothing actually attested to the commit — covers both "nothing has triggered yet" and "this repo triggered nothing matching `CI_WORKFLOW_FILE`/`CI_JOB_NAME`". Indistinguishable from the jobs list, but **not** equally safe to act on, so `NONE` does not end the wait for the first 90s (`CI_NONE_GRACE_S`). |
 
 **A `NONE` that outlasts the grace window means "nothing to report". A `NONE`
 seen immediately does not.** `ci_settled` is the difference, and the trap it
@@ -127,6 +127,22 @@ If the review finishes first and CI is still `RUNNING` at the timeout deadline,
 the poller prints a short "review decided, CI still open" line instead of the
 full `TIMED_OUT` block — the review verdict is real and does not need to be
 re-litigated just because CI is slow.
+
+**A skipped job is not a failed one.** A job whose `if:` evaluated false
+completes with conclusion `skipped`, and that is the *designed* outcome for a
+conditional job — Actions has no way to say "do not create this job at all", so
+a skipped job is the only shape the feature has. `marim-harness`'s quality gate
+splits baseline promotion into a `promote` job guarded by
+`github.event_name == 'push'`, precisely so a `pull_request` run never holds a
+`contents: write` token; that job is skipped on every PR run and always will be.
+Counting it as `FAILED` reported run 2649 — `gate` succeeded, `report` succeeded,
+overall conclusion `success` — as a red CI, and because `FAILED` is terminal it
+bailed out before the review could land. That false red would have recurred on
+every PR in the repo forever. `skipped` and `neutral` are now excluded from the
+worst-of ordering: they neither fail the verdict nor hold it open, and they are
+still named in the `PASSED` detail with `(not gating)` so a job you expected to
+run cannot vanish quietly. If *every* matched job was skipped the verdict is
+`NONE`, not `PASSED` — nothing ran, and that is not an all-clear.
 
 **A `FAILED` CI stops the wait immediately.** `classify_ci` checks failed before
 running, so `FAILED` is terminal the moment it appears — a completed non-success

@@ -146,15 +146,35 @@ class CIVerdict:
 
 
 def _job_state(job: dict, now: datetime) -> tuple[str, str]:
-    """(state, detail) for one job object -- PASSED | FAILED | RUNNING.
+    """(state, detail) for one job -- PASSED | FAILED | SKIPPED | RUNNING.
 
     RUNNING covers queued, waiting and in_progress alike -- the reader does
-    not need those distinguished, only "not decided yet" vs "decided"."""
+    not need those distinguished, only "not decided yet" vs "decided".
+
+    SKIPPED is not a failure, and folding it into one was a real bug. A job
+    whose `if:` evaluated false completes with conclusion 'skipped', which is
+    the *designed* outcome for a conditional job, not a malfunction:
+    marim-harness's quality gate splits baseline promotion into a `promote`
+    job guarded by `github.event_name == 'push'`, precisely so a
+    pull_request run never holds a `contents: write` token. That job is
+    therefore skipped on every PR run and always will be. Reading it as
+    FAILED reported a green gate (run 2649: gate=success, report=success)
+    as a red CI, and since FAILED is terminal it bailed out of the wait
+    before the review could land -- a false red that would have recurred on
+    every PR in that repo forever. There is no way to express "do not create
+    this job" in Actions; a skipped job is the only shape the feature has.
+
+    'neutral' joins it -- GitHub's own term for "completed, deliberately
+    neither pass nor fail". 'cancelled' deliberately does NOT: an aborted job
+    decided nothing about the commit, and anything softer than FAILED there
+    would let a cancelled run read as clean."""
     status = job.get("status")
     conclusion = job.get("conclusion")
     if status == "completed":
         if conclusion == "success":
             return "PASSED", "succeeded"
+        if conclusion in ("skipped", "neutral"):
+            return "SKIPPED", f"concluded {conclusion!r} (not gating)"
         return "FAILED", f"concluded {conclusion!r}"
     started = parse_ts(job.get("started_at"))
     detail = f"status={status or '?'}"
@@ -182,6 +202,12 @@ def classify_ci(jobs: list[dict], now: datetime) -> CIVerdict:
     other job passed; short of that, one RUNNING job keeps it open even if
     the rest already finished -- a job still in flight is still a reason not
     to merge on the assumption everything passed.
+
+    SKIPPED jobs are excluded from that ordering entirely: they neither fail
+    the verdict nor hold it open, because a conditional job that correctly
+    did not run says nothing either way. They are still named in the PASSED
+    detail. If *every* matched job was skipped the verdict is NONE, not
+    PASSED -- see below.
     """
     if not jobs:
         scope = CI_WORKFLOW_FILE or "workflow"
@@ -196,6 +222,7 @@ def classify_ci(jobs: list[dict], now: datetime) -> CIVerdict:
         return CIVerdict(state="NONE", detail=f"no {scope} run found for this commit")
     failed = [(label, d) for label, s, d in labeled if s == "FAILED"]
     running = [(label, d) for label, s, d in labeled if s == "RUNNING"]
+    passed = [(label, d) for label, s, d in labeled if s == "PASSED"]
     if failed:
         return CIVerdict(
             state="FAILED", detail="; ".join(f"{l}: {d}" for l, d in failed)
@@ -204,6 +231,20 @@ def classify_ci(jobs: list[dict], now: datetime) -> CIVerdict:
         return CIVerdict(
             state="RUNNING", detail="; ".join(f"{l}: {d}" for l, d in running)
         )
+    if not passed:
+        # Nothing failed, nothing is running, and nothing passed either --
+        # every matched job was skipped, so no job actually attested to this
+        # commit. That is "nothing to report", which is NONE, not a pass.
+        # Calling it PASSED would manufacture an all-clear out of a workflow
+        # that never ran a check, the same laundering the TIMED_OUT rule
+        # exists to prevent. NONE routes through ci_settled's grace window,
+        # which is the conservative path.
+        return CIVerdict(
+            state="NONE", detail="every matched job was skipped; nothing ran"
+        )
+    # Skipped jobs stay in the detail line -- not gating is not the same as
+    # not worth seeing, and a job the reader expected to run and that quietly
+    # skipped is exactly what they need named.
     return CIVerdict(
         state="PASSED", detail="; ".join(f"{l}: {d}" for l, _s, d in labeled)
     )
