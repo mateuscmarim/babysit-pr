@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wait for gitea.example.com's review-bot to finish reviewing a pull request.
+"""Wait for a Gitea instance's review-bot to finish reviewing a pull request.
 
 Prints one structured verdict and exits. Never merges, never edits anything.
 
@@ -658,7 +658,7 @@ def ci_jobs(
 
 
 def infer_repo() -> str:
-    """owner/name from a gitea.example.com remote in the current checkout."""
+    """owner/name from the current checkout's Gitea remote."""
     try:
         out = subprocess.run(
             ["git", "remote", "-v"], capture_output=True, text=True, check=True

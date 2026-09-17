@@ -1,13 +1,14 @@
 ---
 name: babysit-pr
-description: Use before merging a pull request on gitea.example.com — waits for review-bot's automated review AND the quality-gate CI run to both finish, reports what each found, and stops. Triggers on "babysit this PR", "wait for the review", "is the bot done", "is CI green", or any merge of a gitea PR opened while the reviewer is live.
+description: Use before merging a pull request on a Gitea instance — waits for review-bot's automated review AND the quality-gate CI run to both finish, reports what each found, and stops. Triggers on "babysit this PR", "wait for the review", "is the bot done", "is CI green", or any merge of a gitea PR opened while the reviewer is live.
 ---
 
 # Babysit a PR until the reviewer has spoken
 
-`review-bot` (the [gitea-review-agent](https://gitea.example.com/mateuscmarim/gitea-review-agent),
-deployed on `localhost:8000`) reviews every PR on open, on push, and on
-an explicit review request. It posts a single Gitea review with inline comments.
+`review-bot` (the `gitea-review-agent` companion project, deployed wherever
+`REVIEW_AGENT_HEALTH_URL`/`REVIEW_AGENT_STATE_URL` point) reviews every PR on
+open, on push, and on an explicit review request. It posts a single Gitea
+review with inline comments.
 
 **It cannot stop you merging.** `build_review_payload` hardcodes
 `"event": "COMMENT"` — never `APPROVE`, never `REQUEST_CHANGES` — so branch
@@ -22,16 +23,18 @@ wait.
 python3 ~/.claude/skills/babysit-pr/scripts/poll_review.py
 ```
 
-Repo and PR are inferred from the current checkout's `gitea.example.com` remote and
-branch. Override with `--repo owner/name --pr N`. Other flags: `--once` (check
-now, don't wait), `--timeout-minutes` (default 35), `--interval` (default 30s),
-`--full` (keep the per-file table, which is trimmed by default).
+Repo and PR are inferred from the current checkout's Gitea remote (set
+`GITEA_BASE_URL` to match your instance) and branch. Override with `--repo
+owner/name --pr N`. Other flags: `--once` (check now, don't wait),
+`--timeout-minutes` (default 35), `--interval` (default 30s), `--full` (keep
+the per-file table, which is trimmed by default).
 
 Two environment variables point it at the agent's state endpoint:
-`REVIEW_AGENT_STATE_URL` (default `http://localhost:8000/state`) and
-`REVIEW_AGENT_STATE_TOKEN`, needed only if that deployment sets `STATE_TOKEN`.
-Neither is required — an agent that cannot be reached is reported as
-unreachable, and the poller falls back to reading Gitea alone.
+`REVIEW_AGENT_STATE_URL` (no baked-in default — point it at your own
+review-agent deployment) and `REVIEW_AGENT_STATE_TOKEN`, needed only if that
+deployment sets `STATE_TOKEN`. Neither is required — an agent that cannot be
+reached is reported as unreachable, and the poller falls back to reading
+Gitea alone.
 
 Gitea reads retry. A 35-minute wait at a 30s interval is on the order of
 seventy API calls, and one timeout used to end the whole run with a traceback
@@ -389,11 +392,10 @@ opened. It is also worth a moment's honesty about the destination: if the repo's
 tracker is not actually triaged, an issue is a tidier landfill, not a fix. Say
 what you intend to file and let the human decide.
 
-Verified 2026-08-28 on `mateuscmarim/gitea-review-agent#34`: finding #3128
-(`extract_global_duplication` defaulting a missing percentage to `0.0`) was real
-on `main` but untouched by that PR's diff. Filed as
-[issue #37](https://gitea.example.com/mateuscmarim/gitea-review-agent/issues/37) and
-the thread resolved with a link. It was the repo's **first ever issue** — which
+Verified 2026-08-28 on the `gitea-review-agent` companion repo's PR #34: finding
+#3128 (`extract_global_duplication` defaulting a missing percentage to `0.0`)
+was real on `main` but untouched by that PR's diff. Filed as issue #37 and the
+thread resolved with a link. It was the repo's **first ever issue** — which
 is the caveat above in one data point.
 
 Run `python3 scripts/test_reply_finding.py` from the scripts directory after

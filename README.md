@@ -1,8 +1,8 @@
 # babysit-pr
 
-A Claude Code skill. Waits for [`review-bot`](https://gitea.example.com/mateuscmarim/gitea-review-agent)
-to finish reviewing a PR on `gitea.example.com` **and** for that PR's CI to reach a
-final state, reports what each found, and stops.
+A Claude Code skill. Waits for `review-bot` (the `gitea-review-agent` companion
+project) to finish reviewing a PR on your Gitea instance **and** for that PR's
+CI to reach a final state, reports what each found, and stops.
 
 It exists because the bot cannot block a merge: `build_review_payload`
 hardcodes `"event": "COMMENT"`, never `APPROVE` or `REQUEST_CHANGES`, so branch
@@ -80,9 +80,10 @@ clone to `~/.claude/skills/babysit-pr`.
 python3 ~/.claude/skills/babysit-pr/scripts/poll_review.py
 ```
 
-Repo and PR are inferred from the current checkout's `gitea.example.com` remote and
-branch; override with `--repo owner/name --pr N`. Needs a Gitea token from
-`$GITEA_TOKEN` or the `tea` config — no credentials are stored here.
+Repo and PR are inferred from the current checkout's Gitea remote (set
+`GITEA_BASE_URL` to match your instance) and branch; override with `--repo
+owner/name --pr N`. Needs a Gitea token from `$GITEA_TOKEN` or the `tea`
+config — no credentials are stored here.
 
 ## Tests
 
