@@ -9,8 +9,7 @@ exactly the kind of thing that breaks a one-line curl with escaped JSON.
 This script never decides anything: it takes an already-chosen comment id,
 path, position and reply text as arguments and posts exactly that. Whether a
 finding was fixed, declined, or deferred -- and whether resolving it is safe
--- is still the caller's judgment call (typically
-`superpowers:receiving-code-review`), per the same seam `poll_review.py`
+-- is still the caller's judgment call, per the same seam `poll_review.py`
 documents for itself: the tooling that inspects the diff and reasons about a
 finding must not be the same tooling that publishes a verdict about one.
 
@@ -23,25 +22,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import urllib.error
 import urllib.request
-from pathlib import Path
 
-BASE_URL = os.environ.get("GITEA_BASE_URL", "https://gitea.example.com").rstrip("/")
-TEA_CONFIG = Path.home() / ".config" / "tea" / "config.yml"
-
-
-def token() -> str:
-    if env := os.environ.get("GITEA_TOKEN"):
-        return env
-    if not TEA_CONFIG.exists():
-        sys.exit(f"no token: set GITEA_TOKEN or configure {TEA_CONFIG}")
-    for line in TEA_CONFIG.read_text().splitlines():
-        if line.strip().startswith("token:"):
-            return line.split(":", 1)[1].strip()
-    sys.exit(f"no token: found no 'token:' line in {TEA_CONFIG}")
+from gitea_auth import BASE_URL, token
 
 
 def post(path: str, tok: str, body: dict) -> None:
@@ -98,8 +83,8 @@ def main() -> int:
     ap.add_argument(
         "--resolve",
         action="store_true",
-        help="also resolve the thread -- only for a confirmed, checkable fix; "
-        "see SKILL.md's 'Resolve only what you actually fixed' rules",
+        help="also resolve the thread -- which tells the bot to stop re-checking "
+        "the finding. See SKILL.md's 'Replying to findings' table for when",
     )
     args = ap.parse_args()
 
