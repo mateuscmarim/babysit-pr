@@ -29,7 +29,9 @@ UNKNOWN, never NONE: "I could not look" is not "there is nothing to see".
 
 Exit codes are driven by the review verdict alone: 0 REVIEWED, 1 usage error
 or Gitea unreachable until the deadline, 2 TIMED_OUT, 3 FAILED, 4 SKIPPED,
-5 STALE, 6 DECLINED. CI status is reported, never folded into these -- the two
+5 STALE, 6 DECLINED. A run that does not wait (--once, a closed PR) and finds
+no review yet reports PENDING and exits 2 too, with a banner saying nothing
+timed out. CI status is reported, never folded into these -- the two
 checks fail in unrelated ways and conflating them would make "what do you do"
 ambiguous for both.
 
@@ -661,6 +663,12 @@ def ci_jobs(
     for r in runs:
         if not isinstance(r, dict) or not isinstance(r.get("id"), int):
             continue
+        # The server is asked to filter by ?head_sha=, but a Gitea that ignores
+        # the parameter lists every run in the repo -- and the newest of those,
+        # from any commit, would then stand in for this head's CI. A run that
+        # carries no head_sha cannot be checked, so it is kept.
+        if (run_sha := r.get("head_sha")) and run_sha != sha:
+            continue
         path = (r.get("path") or "").split("@", 1)[0]
         if workflow_file is not None and path != workflow_file:
             continue
@@ -915,6 +923,35 @@ EPILOGUE = {
 }
 
 
+def once_notes(review_state: str, ci: CIVerdict, watched_s: float, closed: bool) -> list[str]:
+    """What a run that did not wait (--once, or a closed PR) owes the reader.
+
+    Its exit code is the review's, same as ever -- which is exactly why it
+    cannot be silent: PENDING exits 2, the code TIMED_OUT uses, though nothing
+    timed out; and a clean review next to a CI still running exits 0, the one
+    code a "can I merge now?" check reads as yes."""
+    notes = []
+    if review_state == "PENDING":
+        why = (
+            "the PR is closed, so no review is coming"
+            if closed
+            else "--once checks once; run without it to wait for review-bot"
+        )
+        notes.append(
+            "\n>> No review has landed for this head (PENDING), and this run did "
+            f"not wait:\n   {why}.\n   Exit 2 here means \"nothing yet\", not "
+            "that a wait timed out. It is NOT a pass."
+        )
+    if not ci_settled(ci, watched_s):
+        notes.append(
+            f"\n>> CI has not settled ({ci.state}) and this run did not wait for "
+            "it. The exit code\n   is the review's alone: do not merge on the "
+            "assumption CI passed. Check the\n   run directly, or re-run without "
+            "--once."
+        )
+    return notes
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", help="owner/name (default: infer from git remote)")
@@ -1050,6 +1087,9 @@ def main(argv: list[str] | None = None) -> int:
         render_ci(ci_verdict)
         if epilogue := EPILOGUE.get(action):
             print(epilogue.format(state=verdict.state))
+        if action == "once":
+            for note in once_notes(verdict.state, ci_verdict, now - watching_since, closed):
+                print(note)
         return exit_code(action, verdict.state)
 
 

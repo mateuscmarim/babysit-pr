@@ -19,8 +19,13 @@ look" never get reported as "clean".
 ## Run it
 
 ```bash
-python3 ~/.claude/skills/babysit-pr/scripts/poll_review.py > "$OUT" 2>&1; echo "exit $?"
+python3 ~/.claude/skills/babysit-pr/scripts/poll_review.py > /tmp/babysit-REPO-PR.out 2>&1; echo "exit $?"
 ```
+
+Run it with the Bash tool's `run_in_background: true`. The wait runs up to 35
+minutes, well past the foreground timeout, and a background command notifies
+you when it exits. Then read the output file. Use one file per PR, or your
+scratchpad. Only `--once` is quick enough to run in the foreground.
 
 Repo and PR are inferred from the checkout's Gitea remote and branch. Flags:
 
@@ -45,7 +50,8 @@ Repo and PR are inferred from the checkout's Gitea remote and branch. Flags:
 The poller only reads. It never merges, comments, resolves or edits.
 
 **Backgrounding.** Redirect to a file and read it after the process exits.
-The exit code is the signal. Do **not** follow the file with a bare
+The exit code is the signal. Do **not** poll the file while you wait, and
+never follow it with a bare
 `tail -f`: it outlives the poller, and one per round piles up as orphaned
 processes. If you want live output, bound it:
 `timeout 40m tail -n +1 -f "$OUT"`. Run one poller per PR, and stop it if
@@ -61,11 +67,16 @@ the PR closes (a closed PR is reported once and never waited on anyway).
 | `FAILED` | 3 | The bot posted `⚠️`, or the agent reported a failure. `credentials`, `quota`, `oversized` and `backend_rejected` need an operator. `generic`, `backend_error` and `review_timeout` might pass on a fresh review request. | Fix the service, or merge knowing it is unreviewed. Never treat it as clean. |
 | `SKIPPED` | 4 | The diff is too large (`MAX_DIFF_LINES` 4000 / `MAX_DIFF_BYTES` 400000). No review is coming. | Split the PR, or review it yourself. |
 | `STALE` | 5 | The only review is for an **older SHA**, because you pushed since. Its findings are printed in full under a banner naming that SHA. | Read them, since they usually still apply. The poller keeps waiting and exits 5 only at the deadline or on a CI failure. |
+| `PENDING` | 2 | Only from a run that did not wait: `--once`, or a closed PR. Nothing has landed for this head yet. A banner says nothing timed out. | **Not a pass.** Run without `--once` to wait. A closed PR gets no new review. |
 | `DECLINED` | 6 | The agent says no review is coming for this SHA, and why: diff empty after `SKIP_PATHS`, `nothing_new_since_last_review`, superseded, a bot-authored PR, `lost_on_restart`… | Read the reason. `nothing_new…` means the last review stands. `lost_on_restart` means nobody reviewed this, so re-request. |
 
 **The fail-fast exit is not a verdict.** When CI fails first, the poller stops
 and returns the review's code as it stands: 2 if the review is still pending,
 5 if it is stale. A banner says so. Read the banner, not the number.
+
+**`--once` does not wait for CI either.** A `REVIEWED` next to a CI that is
+still running exits 0, with a "CI has not settled" note. That 0 is the
+review's. It says nothing about CI.
 
 ## The CI verdict: reported, never folded into the exit code
 

@@ -4,6 +4,28 @@ The incidents behind the rules in `SKILL.md`. SKILL.md says what to do; this
 file says what went wrong when it was not done. Read it before loosening a
 rule. Newest first.
 
+## 2026-09-24: `--once` exited 0 on a running CI, and another commit's run counted
+
+A second review pass. Each bug was reproduced against the `main()` harness
+before it was fixed.
+
+- **`--once` was silent about unsettled CI.** A `REVIEWED` next to a running
+  CI hit the `once` action, which printed no epilogue: exit 0 and a
+  `CI: RUNNING` block, nothing else. `--once` is the "can I merge now?" check,
+  so that was the shortest path to a false all-clear. `once_notes` now says
+  CI has not settled.
+- **`PENDING` was undocumented.** `--once` or a closed PR with no review
+  printed `=== PENDING` and exited 2, the code SKILL.md gave only to
+  `TIMED_OUT`. It now has a row in the table and a banner saying it is not a
+  pass.
+- **CI trusted the server's `?head_sha=` filter.** A Gitea that ignores the
+  parameter lists every run in the repo. The newest run per workflow, from
+  any commit, then became this head's CI verdict, and it could shadow the
+  head's own run. `ci_jobs` now drops runs whose `head_sha` differs.
+- **SKILL.md's run command could not work as written.** `$OUT` was never
+  set, and a 35-minute wait outlives the Bash tool's foreground timeout. It
+  now names a file and says to use `run_in_background`.
+
 ## 2026-09-24: an unreadable CI read as "no CI", and other ambiguities
 
 This came out of a review of the whole skill. Every fix here closes a path

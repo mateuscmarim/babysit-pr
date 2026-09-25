@@ -528,6 +528,18 @@ def _():
     ))
     check("different events at the same SHA both count", classify_ci(got, NOW).state, "FAILED")
 
+    # A Gitea that ignores ?head_sha= lists every run in the repo. A newer run
+    # from another commit must neither count nor shadow the head's own run.
+    got = ci_jobs(runs_then_jobs(
+        [{"id": 5, "path": "ci.yml@x", "event": "pull_request", "head_sha": OLD},
+         {"id": 4, "path": "ci.yml@x", "event": "pull_request", "head_sha": HEAD}],
+        {5: [{"name": "t", "status": "completed", "conclusion": "failure"}],
+         4: [{"name": "t", "status": "completed", "conclusion": "success"}]},
+    ))
+    check("a run at another SHA is ignored, not newest-wins", classify_ci(got, NOW).state, "PASSED")
+    check("only runs at another SHA -> []",
+          ci_jobs(runs_then_jobs([{"id": 5, "path": "ci.yml@x", "head_sha": OLD}], {})), [])
+
     # Jobs are paged: a matrix build can exceed one page.
     many = [{"id": i, "name": f"m{i}", "status": "completed", "conclusion": "success"} for i in range(51)]
 
@@ -911,6 +923,8 @@ def _():
     code, out, clock = run_main(FakeGitea(pr=lambda n: {"state": "closed", "merged": True}))
     check("merged PR -> reported once, no waiting", (code, clock.sleeps), (2, []))
     ok("  says so", "already MERGED" in out, out)
+    ok("  and that exit 2 is 'nothing yet', not a pass",
+       "PENDING" in out and "NOT a pass" in out and "PR is closed" in out, out)
 
     code, out, clock = run_main(FakeGitea(pr=lambda n: {"state": "closed"} if n >= 3 else {}))
     check("closed mid-wait -> stops", (code, len(clock.sleeps)), (2, 1))
@@ -921,6 +935,20 @@ def _():
 
     code, out, clock = run_main(FakeGitea(jobs=lambda n: RUNNING_JOB), "--once")
     check("--once reports without waiting", (code, clock.sleeps), (2, []))
+    ok("  names PENDING as not a pass", "PENDING" in out and "NOT a pass" in out, out)
+    ok("  and says CI has not settled", "CI has not settled" in out, out)
+
+    # The likeliest "can I merge now?" check: a clean review next to a CI that
+    # is still running. The code stays the review's, but it must not be silent.
+    code, out, clock = run_main(
+        FakeGitea(reviews=lambda n: [review(HEAD, rid=5)], jobs=lambda n: RUNNING_JOB), "--once")
+    check("--once, REVIEWED + CI running -> review's exit 0", (code, clock.sleeps), (0, []))
+    ok("  with a CI-not-settled note", "CI has not settled" in out and "CI: RUNNING" in out, out)
+    ok("  and no PENDING banner", "NOT a pass" not in out, out)
+
+    code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(HEAD, rid=5)]), "--once")
+    check("--once, REVIEWED + CI passed -> exit 0", code, 0)
+    ok("  with no CI note", "CI has not settled" not in out, out)
 
 
 if __name__ == "__main__":
