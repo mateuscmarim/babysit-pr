@@ -4,6 +4,32 @@ The incidents behind the rules in `SKILL.md`. SKILL.md says what to do; this
 file says what went wrong when it was not done. Read it before loosening a
 rule. Newest first.
 
+## 2026-09-25: every exit code means one thing, and the first live check
+
+**Exit codes.** Stopping without a review verdict used to borrow a
+verdict's code. `PENDING` from `--once` or a closed PR exited 2, like
+`TIMED_OUT`. The CI fail-fast exited 2 or 5 depending on the review's state
+at that moment. So exit 2 meant three different things, and only the banner
+told them apart. `PENDING` is now 7 and `CI_FAILED` is 8. Once the review has
+decided, CI still never changes the code. Nothing outside this repo read the
+old numbers.
+
+**Live check** of the 2026-09-24 fixes, `--once` against real PRs:
+
+- `marim-harness#219` (open, CI running): `REVIEWED`, exit 0, one open
+  inline finding, and the new "CI has not settled" note.
+- `marim-harness#222` and `action-items-android#89` (merged): reported once
+  as merged, `CI: PASSED` across two workflows each. The skipped `promote`
+  job was marked as not gating.
+- The raw API confirmed:
+  - Runs carry `head_sha`, and this instance honours `?head_sha=` (2 of
+    1,228 runs), so the client-side filter is a safety net here.
+  - `path` is a bare file name (`ci.yml@refs/pull/219/head`).
+  - Review comments carry `position` and `original_position`, with the
+    latter 0 on the new side.
+- Not yet checked live: a real old-side comment, and the resolve endpoint.
+  Resolving writes, so it is not probed on a live PR.
+
 ## 2026-09-24: the rest of the second review pass
 
 Smaller gaps from the same review. Each one has a test that failed before

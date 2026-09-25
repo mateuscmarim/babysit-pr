@@ -44,9 +44,9 @@ flowchart TD
 
     I -->|yes| IX(["the review's own exit code<br/>REVIEWED 0 · FAILED 3<br/>SKIPPED 4 · DECLINED 6"])
     I -->|no| J{"--once or PR closed?"}
-    J -->|yes| JX(["report what is known now,<br/>do not wait"])
+    J -->|yes| JX(["report what is known now, do not wait<br/>the review's code, or PENDING · exit 7<br/>+ a note if CI has not settled"])
     J -->|no| K{"CI FAILED?<br/>unless --no-fail-fast"}
-    K -->|yes| KX(["bail early · review's code<br/>PENDING falls back to 2<br/>a STALE review's findings<br/>are still fetched first"])
+    K -->|yes| KX(["CI_FAILED · exit 8<br/>bail early; a STALE review's<br/>findings are still fetched first"])
     K -->|no| L{"past the deadline?"}
     L -->|no| M["print progress, sleep --interval"]
     M --> D
@@ -62,18 +62,19 @@ flowchart TD
 
 Four things this shape depends on:
 
-- **Exit codes come from the review side only.** CI gets its own block and is
-  never folded into the code. `PASSED` CI next to a `FAILED` review is still
-  exit 3, so read both blocks, not the number.
+- **Once the review decides, the code is the review's.** CI gets its own
+  block. `PASSED` CI next to a `FAILED` review is still exit 3, and a failed
+  CI next to a `REVIEWED` is still 0, so read both blocks, not the number.
 - **`TIMED_OUT` is the last branch, not the default.** The decline paths now
   report as `DECLINED` with a reason, and a Gitea outage reports as
   `UNREACHABLE`. Reaching `TIMED_OUT` means none of them applied.
 - **"Could not look" is never "nothing there".** An unreadable Actions API is
   `UNKNOWN`, not `NONE`. A Gitea that stays down is `UNREACHABLE`, not
   `TIMED_OUT`.
-- **The CI fail-fast escape returns the *review's* code.** So an undecided
-  review bails with exit 2, the same code as `TIMED_OUT`, which means
-  something else entirely. That is why it prints an explicit banner.
+- **Every code means one thing.** Stopping early has codes of its own:
+  `PENDING` (7) when a run did not wait, `CI_FAILED` (8) when CI failed
+  before the review decided. They used to borrow 2 and 5, so exit 2 could
+  mean `TIMED_OUT`, "did not wait" or "CI failed first".
 
 ## This repo *is* the installed skill
 

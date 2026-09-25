@@ -27,21 +27,24 @@ None of the jobs set `timeout-minutes`, so a hang reports as RUNNING with a
 growing elapsed time, not as a failure. A CI API that cannot be read is
 UNKNOWN, never NONE: "I could not look" is not "there is nothing to see".
 
-Exit codes are driven by the review verdict alone: 0 REVIEWED, 1 usage error
-or Gitea unreachable until the deadline, 2 TIMED_OUT, 3 FAILED, 4 SKIPPED,
-5 STALE, 6 DECLINED. A run that does not wait (--once, a closed PR) and finds
-no review yet reports PENDING and exits 2 too, with a banner saying nothing
-timed out. CI status is reported, never folded into these -- the two
-checks fail in unrelated ways and conflating them would make "what do you do"
+Each exit code means one thing. 0 REVIEWED, 3 FAILED, 4 SKIPPED, 5 STALE and
+6 DECLINED are the review's verdict; 2 TIMED_OUT is the deadline with nothing
+from the bot. Two more say why the poller stopped without one: 7 PENDING, a
+run that did not wait (--once, a closed PR) and found nothing yet; 8
+CI_FAILED, CI failed before the review decided. 1 is everything with no
+verdict at all: Gitea unreachable to the deadline, a usage error, a 4xx.
+
+Once the review has decided, CI never changes the code: a REVIEWED next to a
+failed CI is still 0, and the CI block says the rest. The two checks fail in
+unrelated ways, and folding them together would make "what do you do"
 ambiguous for both.
 
-A FAILED CI verdict does, however, stop the *wait* (--no-fail-fast keeps
-waiting). That is a scheduling decision, not an exit-code one: the code
-returned is still whatever the review verdict was, PENDING falling back to 2
-exactly as under --once. A failed job changes only when someone acts -- pushes
-a fix, which also makes any review still in flight stale, or re-runs the job
-by hand -- so waiting on it buys nothing. A STALE review's inline findings are
-fetched before bailing, so the early return never swallows them.
+A FAILED CI verdict before that point stops the *wait* (--no-fail-fast keeps
+waiting) and exits 8, whatever the undecided review looked like. A failed job
+changes only when someone acts -- pushes a fix, which also makes any review
+still in flight stale, or re-runs the job by hand -- so waiting on it buys
+nothing. A STALE review's inline findings are fetched before bailing, so the
+early return never swallows them.
 
 A closed or merged PR is checked once and reported, not waited on: it will not
 get another review.
@@ -521,16 +524,21 @@ def decide(
 
 
 EXIT = {"REVIEWED": 0, "TIMED_OUT": 2, "FAILED": 3, "SKIPPED": 4, "STALE": 5,
-        "DECLINED": 6}
+        "DECLINED": 6, "PENDING": 7, "CI_FAILED": 8}
 EXIT_UNREACHABLE = 1
 
 
 def exit_code(action: str, review_state: str) -> int:
-    """The review's own code; PENDING has none, so it reads as 2 (TIMED_OUT)."""
+    """The review's own code, unless the action says why there is none.
+
+    PENDING and CI_FAILED used to borrow 2 and 5, so one number meant
+    TIMED_OUT, "did not wait" or "CI failed first" depending on the banner."""
     if action == "timed_out":
         return EXIT["TIMED_OUT"]
     if action == "stale":
         return EXIT["STALE"]
+    if action == "ci_failed":
+        return EXIT["CI_FAILED"]
     return EXIT.get(review_state, EXIT["TIMED_OUT"])
 
 
@@ -1005,10 +1013,9 @@ EPILOGUE = {
 def once_notes(review_state: str, ci: CIVerdict, watched_s: float, closed: bool) -> list[str]:
     """What a run that did not wait (--once, or a closed PR) owes the reader.
 
-    Its exit code is the review's, same as ever -- which is exactly why it
-    cannot be silent: PENDING exits 2, the code TIMED_OUT uses, though nothing
-    timed out; and a clean review next to a CI still running exits 0, the one
-    code a "can I merge now?" check reads as yes."""
+    A clean review next to a CI still running exits 0, the one code a "can I
+    merge now?" check reads as yes, so it cannot go out without a note. PENDING
+    has its own code (7) but still gets told what to do next."""
     notes = []
     if review_state == "PENDING":
         why = (
@@ -1018,8 +1025,8 @@ def once_notes(review_state: str, ci: CIVerdict, watched_s: float, closed: bool)
         )
         notes.append(
             "\n>> No review has landed for this head (PENDING), and this run did "
-            f"not wait:\n   {why}.\n   Exit 2 here means \"nothing yet\", not "
-            "that a wait timed out. It is NOT a pass."
+            f"not wait:\n   {why}.\n   Exit 7 means \"nothing yet\". It is NOT "
+            "a pass."
         )
     if not ci_settled(ci, watched_s):
         notes.append(

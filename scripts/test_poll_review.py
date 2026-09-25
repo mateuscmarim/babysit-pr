@@ -388,8 +388,11 @@ def _():
     check("deadline, nothing -> timed_out", d("PENDING", PASSED, past=True), "timed_out")
 
     check("exit: done uses the review's code", poll_review.exit_code("done", "FAILED"), 3)
-    check("exit: PENDING falls back to 2", poll_review.exit_code("once", "PENDING"), 2)
-    check("exit: ci_failed keeps a STALE review's 5", poll_review.exit_code("ci_failed", "STALE"), 5)
+    check("exit: PENDING from a run that did not wait -> 7, not TIMED_OUT's 2", poll_review.exit_code("once", "PENDING"), 7)
+    check("exit: ci_failed -> 8 over a STALE review", poll_review.exit_code("ci_failed", "STALE"), 8)
+    check("exit: ci_failed -> 8 over a PENDING review", poll_review.exit_code("ci_failed", "PENDING"), 8)
+    check("exit: every code means one thing", len(set(EXIT.values()) | {poll_review.EXIT_UNREACHABLE}),
+          len(EXIT) + 1)
     check("exit: stale -> 5", poll_review.exit_code("stale", "STALE"), 5)
     check("exit: timed_out -> 2", poll_review.exit_code("timed_out", "PENDING"), 2)
 
@@ -952,13 +955,13 @@ def _():
         inline=lambda rid: [{"id": 77, "path": "a.py", "position": 3, "body": "old finding", "resolver": None}],
     )
     code, out, clock = run_main(gitea)
-    check("CI failed + STALE review -> stops at once with 5", (code, clock.sleeps), (5, []))
+    check("CI failed + STALE review -> stops at once with 8", (code, clock.sleeps), (8, []))
     ok("  prints the stale review's findings, inline ones included",
        "cost columns" in out and "old finding" in out, out)
     ok("  and the fail-fast banner", "CI FAILED" in out and "re-run the job" in out, out)
 
     code, out, clock = run_main(FakeGitea(jobs=lambda n: FAILED_JOB))
-    check("CI failed + no review -> exit 2 at once", (code, clock.sleeps), (2, []))
+    check("CI failed + no review -> exit 8 at once, not TIMED_OUT's 2", (code, clock.sleeps), (8, []))
 
     code, out, clock = run_main(FakeGitea(jobs=lambda n: FAILED_JOB), "--no-fail-fast")
     check("--no-fail-fast waits the review out", code, 2)
@@ -1025,20 +1028,20 @@ def _():
 @section("main: PR state")
 def _():
     code, out, clock = run_main(FakeGitea(pr=lambda n: {"state": "closed", "merged": True}))
-    check("merged PR -> reported once, no waiting", (code, clock.sleeps), (2, []))
+    check("merged PR -> PENDING, exit 7, no waiting", (code, clock.sleeps), (7, []))
     ok("  says so", "already MERGED" in out, out)
     ok("  and that exit 2 is 'nothing yet', not a pass",
        "PENDING" in out and "NOT a pass" in out and "PR is closed" in out, out)
 
     code, out, clock = run_main(FakeGitea(pr=lambda n: {"state": "closed"} if n >= 3 else {}))
-    check("closed mid-wait -> stops", (code, len(clock.sleeps)), (2, 1))
+    check("closed mid-wait -> stops with 7", (code, len(clock.sleeps)), (7, 1))
     ok("  says so", "closed mid-wait" in out, out)
 
     code, out, clock = run_main(FakeGitea(author=BOT))
     check("bot-authored PR -> DECLINED at once", (code, clock.sleeps), (6, []))
 
     code, out, clock = run_main(FakeGitea(jobs=lambda n: RUNNING_JOB), "--once")
-    check("--once reports without waiting", (code, clock.sleeps), (2, []))
+    check("--once reports without waiting, exit 7", (code, clock.sleeps), (7, []))
     ok("  names PENDING as not a pass", "PENDING" in out and "NOT a pass" in out, out)
     ok("  and says CI has not settled", "CI has not settled" in out, out)
 
