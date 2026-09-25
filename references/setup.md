@@ -29,7 +29,8 @@ PR opened from a fork is found in the upstream.
 ## Backgrounding
 
 Redirect to a file and read it after the process exits. The exit code is the
-signal. Do **not** poll the file while you wait, and never follow it with a
+signal. Start it, end your turn, and let the exit notification wake you. Do
+**not** poll the file or set up a monitor while you wait, and never follow it with a
 bare `tail -f`: it outlives the poller, and one per round piles up as orphaned
 processes. If you want live output, bound it:
 `timeout 40m tail -n +1 -f "$OUT"`.

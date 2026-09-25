@@ -19,9 +19,11 @@ python3 ~/.claude/skills/babysit-pr/scripts/poll_review.py > /tmp/babysit-REPO-P
 ```
 
 Use the Bash tool's `run_in_background: true`: the wait runs up to 35
-minutes, and you are notified when it exits. Then read the output file once.
-Don't poll or `tail -f` it while you wait. `--once` checks without waiting
-and can run in the foreground.
+minutes, and you are notified when it exits. After starting it, **end your
+turn** and wait for that notification. Don't monitor, poll or `tail -f` the
+file, and don't make placeholder calls (`echo waiting`, `true`, `sleep`) to
+pass the time. When notified, read the output file once. `--once` checks
+without waiting and can run in the foreground.
 
 Repo and PR are inferred from the checkout. Pass `--repo owner/name --pr N`
 from anywhere else. Other flags, the environment variables and live-output

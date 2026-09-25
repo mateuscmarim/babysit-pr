@@ -4,6 +4,19 @@ The incidents behind the rules in `SKILL.md`. SKILL.md says what to do; this
 file says what went wrong when it was not done. Read it before loosening a
 rule. Newest first.
 
+## 2026-09-24: cold agents filled the wait with busywork
+
+Two fresh agents, one per model, were given only a "babysit this PR"
+request. Both loaded the skill, ran the poller in the background, followed
+NEXT to the right verdict and verified the open finding against the code.
+Neither opened `references/`, so the short `SKILL.md` was enough.
+
+Both wasted calls while waiting. One set up a monitor that grepped the output
+file every 15s, and both issued placeholder calls (`echo waiting`, `true`).
+The harness already wakes the agent when a background run exits, so
+`SKILL.md` now says to end the turn after starting it, and names the
+busywork not to do.
+
 ## 2026-09-24: an outage made `--once` slow and nameless
 
 Testing the NEXT block live, one Gitea endpoint timed out for about two
