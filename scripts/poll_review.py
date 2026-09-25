@@ -876,14 +876,8 @@ def render(
     if verdict.state == "STALE":
         print(
             f"\n!! These findings describe {(verdict.reviewed_sha or '?')[:8]}, "
-            f"NOT the head {head[:8]}.\n"
-            "!! That is the normal case, not a leftover: review-bot routinely "
-            "lands a review\n"
-            "!! anchored to the head you already pushed past. Read them — they "
-            "were written\n"
-            "!! about code you probably still have — then verify each one "
-            "against the current\n"
-            "!! tree before acting on it."
+            f"NOT the head {head[:8]}. That is normal:\n"
+            "!! review-bot often lands a review on a head you already pushed past."
         )
     elif verdict.state != "REVIEWED":
         return
@@ -952,17 +946,13 @@ def report_timed_out(
         )
         print(f"  queue={svc.get('queue')} counters={svc.get('counters')}")
     print(
-        "\nNo review, no skip notice, no failure notice.\n"
-        "This is NOT an approval. It means one of:\n"
+        "\nNo review, no skip notice, no failure notice. It means one of:\n"
         "  - the agent is still working (it allows up to ~30 min),\n"
-        "  - the webhook never arrived — a `deliveries` counter of 0 "
-        "above says so, and a nonzero `rejected_signature` means the\n"
-        "    WEBHOOK_SECRET is wrong,\n"
+        "  - the webhook never arrived: `deliveries` 0 above says so, and a "
+        "nonzero `rejected_signature` means the WEBHOOK_SECRET is wrong,\n"
         "  - the agent could not be asked at all (see the state line).\n"
-        "The decline paths — an empty diff after SKIP_PATHS, nothing new since "
-        "the last review, a declined event,\n"
-        "a job lost to a restart — report as DECLINED before the deadline. "
-        "Reaching this message means it was none of them."
+        "A decline (empty diff, nothing new, a lost job) would have exited 6 "
+        "before the deadline."
     )
     if not requested:
         # Not a diagnosis: parse_event enqueues on `opened` regardless of
@@ -987,55 +977,146 @@ def report_timed_out(
     render_ci(ci)
 
 
-EPILOGUE = {
-    "ci_failed": (
-        "\n>> CI FAILED and the review is still {state}. Stopping early: a "
-        "failed job stays failed\n   until someone acts — push a fix (which "
-        "makes any review landing meanwhile stale)\n   or re-run the job — "
-        "then re-run this poller.\n   The review above (if any) has NOT "
-        "decided anything — do not read this as a pass.\n   Pass "
-        "--no-fail-fast to wait for review-bot anyway."
-    ),
-    "ci_open": (
-        "\nReview finished, but CI did not settle within the timeout budget — "
-        "still running, or it\ncould not be read (see the CI block). Not a "
-        "failure — but do not merge on the assumption\nit passed; check the "
-        "run directly."
-    ),
-    "stale": (
-        "\nThe review above is real but anchored to an older SHA, so it is not "
-        "a verdict on\nwhat you are about to merge. It is also not nothing: "
-        "read it. Re-request the bot\nif you need a review of the current head."
-    ),
-}
+REPLYING_DOC = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "references", "replying.md"
+)
+# Failure reasons a fresh review request cannot fix: someone has to change the
+# service. The rest (generic, backend_error, review_timeout) may pass on a retry.
+OPERATOR_FAILURES = ("credentials", "quota", "oversized", "backend_rejected")
 
 
-def once_notes(review_state: str, ci: CIVerdict, watched_s: float, closed: bool) -> list[str]:
-    """What a run that did not wait (--once, or a closed PR) owes the reader.
+def next_steps(
+    action: str, verdict: Verdict, ci: CIVerdict, *, watched_s: float, closed: bool
+) -> list[str]:
+    """What to do now, for this result only. It is the last thing a run prints.
 
-    A clean review next to a CI still running exits 0, the one code a "can I
-    merge now?" check reads as yes, so it cannot go out without a note. PENDING
-    has its own code (7) but still gets told what to do next."""
-    notes = []
-    if review_state == "PENDING":
+    It lives here rather than in SKILL.md, so the reader does not carry a table
+    of nine exit codes through a 35-minute wait: the one step it needs arrives
+    with the result. Every "not a pass" rule that applies is restated here, at
+    the point where it would be broken."""
+    state = verdict.state
+    steps = []
+    if action == "timed_out":
+        steps += [
+            "Nothing came from review-bot. Report it as TIMED_OUT: it is NOT an "
+            "approval, and never \"no issues found\".",
+            "The lines above say why, if the agent could be asked. Re-request "
+            "review-bot and re-run this poller, or merge and say plainly that it "
+            "went in unreviewed.",
+        ]
+    elif action == "ci_failed":
+        steps += [
+            f"CI FAILED while the review is still {state}. Fix it and push (a push "
+            "restarts the review too), or re-run the job, then re-run this "
+            "poller. The review has decided nothing: this is not a pass.",
+            "To wait for review-bot anyway, pass --no-fail-fast.",
+        ]
+    elif state == "PENDING":
         why = (
             "the PR is closed, so no review is coming"
             if closed
-            else "--once checks once; run without it to wait for review-bot"
+            else "run without --once to wait for review-bot"
         )
-        notes.append(
-            "\n>> No review has landed for this head (PENDING), and this run did "
-            f"not wait:\n   {why}.\n   Exit 7 means \"nothing yet\". It is NOT "
-            "a pass."
+        steps.append(
+            f"No review has landed for this head, and this run did not wait: "
+            f"{why}. PENDING means \"nothing yet\". It is NOT a pass."
         )
-    if not ci_settled(ci, watched_s):
-        notes.append(
-            f"\n>> CI has not settled ({ci.state}) and this run did not wait for "
-            "it. The exit code\n   is the review's alone: do not merge on the "
-            "assumption CI passed. Check the\n   run directly, or re-run without "
-            "--once."
+
+    if action == "timed_out":
+        pass
+    elif state == "REVIEWED":
+        steps.append(
+            "Verify each finding above against the code before acting on it: the "
+            "inline comments, the unanchored findings and the overview prose all "
+            "count."
+            if verdict.inline or verdict.notes
+            else "No inline or unanchored findings. Still read the overview: its "
+            "prose can name a defect on its own."
         )
-    return notes
+    elif state == "STALE":
+        steps.append(
+            f"The findings above describe {(verdict.reviewed_sha or '?')[:8]}, an "
+            "older head. Verify each against the current tree: they usually still "
+            "apply. Re-request review-bot if you need a review of this head."
+        )
+    elif state == "FAILED":
+        steps.append(
+            "review-bot failed for a reason only an operator can fix (above). The "
+            "PR is unreviewed: fix the service, or merge and say so. Never report "
+            "it as clean."
+            if any(k in verdict.detail for k in OPERATOR_FAILURES)
+            else "review-bot failed (above). A fresh review request may succeed: "
+            "re-request it and re-run. Until then the PR is unreviewed. Never "
+            "report it as clean."
+        )
+    elif state == "SKIPPED":
+        steps.append(
+            "The diff is too large for review-bot, and no review is coming. Split "
+            "the PR, or review it yourself."
+        )
+    elif state == "DECLINED":
+        if "nothing_new_since_last_review" in verdict.detail:
+            steps.append(
+                "Nothing changed since the last review, so that review stands. "
+                "Its findings are on the earlier head: read them there."
+            )
+        elif "lost_on_restart" in verdict.detail:
+            steps.append(
+                "The job was lost when the agent restarted: nobody reviewed this "
+                "head. Re-request review-bot and re-run."
+            )
+        else:
+            steps.append(
+                "review-bot will not review this head, for the reason above. "
+                "Treat the PR as unreviewed unless an earlier review covers it."
+            )
+
+    if action == "ci_failed":
+        pass
+    elif ci.state == "FAILED":
+        steps.append(
+            "CI FAILED (the job is named above). Fix it before merging. The exit "
+            "code is the review's and does not say this."
+        )
+    elif not ci_settled(ci, watched_s):
+        if action == "once":
+            how = "check the run directly" if closed else "check the run, or re-run without --once"
+            steps.append(
+                f"CI has not settled ({ci.state}) and this run did not wait for it. "
+                f"Do not merge on the assumption it passed: {how}."
+            )
+        else:
+            steps.append(
+                f"CI did not settle ({ci.state}) within the budget. Do not merge on "
+                "the assumption it passed: check the run directly."
+            )
+
+    if state in ("REVIEWED", "STALE") and action != "timed_out" and (
+        verdict.inline or verdict.notes
+    ):
+        steps.append(
+            f"Before replying to a finding, resolving a thread or filing an "
+            f"issue, read {REPLYING_DOC}."
+        )
+    return steps
+
+
+def render_next(steps: list[str]) -> None:
+    if steps:
+        print("\n>> NEXT:")
+        for step in steps:
+            print(f"   - {step}")
+
+
+def progress_key(verdict: Verdict, ci: CIVerdict) -> tuple[str, ...]:
+    """What a waiting round's status line says, minus the clock.
+
+    The line is printed only when this changes. A CI detail carries elapsed
+    times ("running 3m12s") that change every round; keyed on those, a
+    35-minute wait wrote 70 near-identical lines for the reader to wade through
+    before the report."""
+    undated = re.sub(r"\d+m\d{2}s", "", ci.detail)
+    return (verdict.state, verdict.detail, ci.state, undated)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1087,7 +1168,10 @@ def main(argv: list[str] | None = None) -> int:
         # DECLINED, not TIMED_OUT: nothing timed out. parse_event files this as
         # `bot_authored_pr`.
         print(f"!! authored by {BOT} — parse_event skips these; no review will come")
-        render_ci(read_ci(repo, head, tok, datetime.now(timezone.utc)))
+        ci = read_ci(repo, head, tok, datetime.now(timezone.utc))
+        render_ci(ci)
+        declined = Verdict(state="DECLINED", detail="bot_authored_pr")
+        render_next(next_steps("done", declined, ci, watched_s=0, closed=closed))
         return EXIT["DECLINED"]
 
     deadline = time.monotonic() + args.timeout_minutes * 60
@@ -1095,6 +1179,7 @@ def main(argv: list[str] | None = None) -> int:
     # Reset on every head move, same as the deadline: the CI grace window asks
     # "has THIS head had time to trigger a run", so a new head restarts it.
     watching_since = time.monotonic()
+    last_progress: tuple[str, ...] = ()
 
     while True:
         try:
@@ -1161,34 +1246,33 @@ def main(argv: list[str] | None = None) -> int:
             if args.once or closed or time.monotonic() >= deadline:
                 print(
                     f"\n=== UNREACHABLE — {repo}#{pr_num} @ {head[:8]} "
-                    f"(waited {waited}s) ===\nGitea could not be read ({reason}).\n"
-                    "No verdict was reached. This is NOT "
-                    "a pass — re-run once Gitea answers."
+                    f"(waited {waited}s) ===\nGitea could not be read ({reason})."
                 )
+                render_next(["No verdict was reached. This is NOT a pass: re-run once Gitea answers."])
                 return EXIT_UNREACHABLE
-            print(f"  [{waited}s] could not read Gitea ({reason}); trying again next interval")
+            if (key := ("unreachable", type(exc).__name__)) != last_progress:
+                last_progress = key
+                print(f"  [{waited}s] could not read Gitea ({reason}); trying again each interval")
             time.sleep(args.interval)
             continue
 
         waited = int(time.monotonic() - started)
         if action == "wait":
-            print(f"  [{waited}s] review={verdict.state}"
-                  f"{': ' + verdict.detail if verdict.detail else ''}"
-                  f" | ci={ci_verdict.state}"
-                  f"{': ' + ci_verdict.detail if ci_verdict.detail else ''}")
+            if (key := progress_key(verdict, ci_verdict)) != last_progress:
+                last_progress = key
+                print(f"  [{waited}s] review={verdict.state}"
+                      f"{': ' + verdict.detail if verdict.detail else ''}"
+                      f" | ci={ci_verdict.state}"
+                      f"{': ' + ci_verdict.detail if ci_verdict.detail else ''}")
             time.sleep(args.interval)
             continue
         if action == "timed_out":
             report_timed_out(repo, pr_num, head, waited, requested, ci_verdict)
-            return exit_code(action, verdict.state)
-
-        render(verdict, repo, pr_num, head, waited, args.full)
-        render_ci(ci_verdict)
-        if epilogue := EPILOGUE.get(action):
-            print(epilogue.format(state=verdict.state))
-        if action == "once":
-            for note in once_notes(verdict.state, ci_verdict, now - watching_since, closed):
-                print(note)
+        else:
+            render(verdict, repo, pr_num, head, waited, args.full)
+            render_ci(ci_verdict)
+        render_next(next_steps(action, verdict, ci_verdict,
+                               watched_s=now - watching_since, closed=closed))
         return exit_code(action, verdict.state)
 
 

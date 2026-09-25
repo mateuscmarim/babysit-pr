@@ -4,7 +4,25 @@ The incidents behind the rules in `SKILL.md`. SKILL.md says what to do; this
 file says what went wrong when it was not done. Read it before loosening a
 rule. Newest first.
 
-## 2026-09-25: every exit code means one thing, and the first live check
+## 2026-09-24: the output says what to do next, and SKILL.md got short
+
+The goal is less for the model to hold in mind. Three changes:
+
+- **`SKILL.md` loaded 1,839 words every time the skill triggered.** Most of
+  it applied only in some cases: the flags and environment, the CI table,
+  TIMED_OUT diagnosis, the reply/resolve policy. The core is now about 550
+  words. The rest moved to `references/`, and each part is read only when
+  the output or the core points to it.
+- **The next step had to be looked up in a table.** The "what you do" column
+  lived in `SKILL.md`, so the reader had to keep nine codes in mind until the
+  run ended. Every exit path now ends with a `>> NEXT:` block written for
+  that result. It replaced the scattered epilogues and `--once` notes, and
+  restates each "not a pass" rule at the point where it would be broken.
+- **A 35-minute wait wrote up to 70 status lines.** One line per round, and
+  CI's elapsed time made each one differ. A line is now printed only when the
+  review or CI state changes, ignoring the clock.
+
+## 2026-09-24: every exit code means one thing, and the first live check
 
 **Exit codes.** Stopping without a review verdict used to borrow a
 verdict's code. `PENDING` from `--once` or a closed PR exited 2, like

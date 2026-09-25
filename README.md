@@ -9,9 +9,11 @@ hardcodes `"event": "COMMENT"`, never `APPROVE` or `REQUEST_CHANGES`, so branch
 protection has nothing to gate on. A review can take ~30 minutes and routinely
 lands after a fast merge. This skill is the only thing that makes you wait.
 
-`SKILL.md` is the real documentation: the verdict tables, the rules, and the
-reply/resolve contract all live there. `HISTORY.md` has the incidents behind
-each rule.
+`SKILL.md` is what the model reads when the skill triggers, and it is kept
+short on purpose. The verdict and CI tables are in `references/verdicts.md`,
+flags and environment in `references/setup.md`, and the reply/resolve
+contract in `references/replying.md`, each read only when needed.
+`HISTORY.md` has the incidents behind each rule.
 
 ## The flow
 
@@ -44,15 +46,15 @@ flowchart TD
 
     I -->|yes| IX(["the review's own exit code<br/>REVIEWED 0 · FAILED 3<br/>SKIPPED 4 · DECLINED 6"])
     I -->|no| J{"--once or PR closed?"}
-    J -->|yes| JX(["report what is known now, do not wait<br/>the review's code, or PENDING · exit 7<br/>+ a note if CI has not settled"])
+    J -->|yes| JX(["report what is known now, do not wait<br/>the review's code, or PENDING · exit 7<br/>+ a NEXT step if CI has not settled"])
     J -->|no| K{"CI FAILED?<br/>unless --no-fail-fast"}
     K -->|yes| KX(["CI_FAILED · exit 8<br/>bail early; a STALE review's<br/>findings are still fetched first"])
     K -->|no| L{"past the deadline?"}
-    L -->|no| M["print progress, sleep --interval"]
+    L -->|no| M["print a status line if anything changed,<br/>sleep --interval"]
     M --> D
 
     L -->|yes| N{"review decided?"}
-    N -->|yes| NX(["the review's exit code<br/>+ 'CI did not settle' note"])
+    N -->|yes| NX(["the review's exit code<br/>+ a 'CI did not settle' NEXT step"])
     N -->|no| O{"review STALE?"}
     O -->|yes| OX(["STALE · exit 5<br/>findings printed in full"])
     O -->|no| PX(["TIMED_OUT · exit 2<br/>NOT an approval"])
@@ -60,7 +62,7 @@ flowchart TD
     I -.- Z["ci_settled: RUNNING never settles.<br/>PASSED and FAILED settle at once.<br/>UNKNOWN settles only on a 4xx;<br/>a transport error holds the wait.<br/>NONE only after 90s watching this head,<br/>since Gitea may not have created the run yet."]
 ```
 
-Four things this shape depends on:
+Five things this shape depends on:
 
 - **Once the review decides, the code is the review's.** CI gets its own
   block. `PASSED` CI next to a `FAILED` review is still exit 3, and a failed
@@ -75,6 +77,10 @@ Four things this shape depends on:
   `PENDING` (7) when a run did not wait, `CI_FAILED` (8) when CI failed
   before the review decided. They used to borrow 2 and 5, so exit 2 could
   mean `TIMED_OUT`, "did not wait" or "CI failed first".
+- **The output says what to do next.** Every exit path ends with a `>> NEXT:`
+  block written for that result: verify these findings, fix CI first, this
+  is not a pass. The reader follows the step in front of it instead of
+  keeping a table of nine codes in mind through a 35-minute wait.
 
 ## This repo *is* the installed skill
 

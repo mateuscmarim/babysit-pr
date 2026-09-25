@@ -815,6 +815,55 @@ def _():
         "https://git.example.com"), "T")
 
 
+@section("next_steps")
+def _():
+    V, PASSED = poll_review.Verdict, CIVerdict("PASSED")
+
+    def steps(action, verdict, ci=PASSED, closed=False):
+        return " | ".join(poll_review.next_steps(action, verdict, ci, watched_s=600, closed=closed))
+
+    finding = [{"id": 1}]
+    ok("REVIEWED with findings -> verify each, and where the reply rules live",
+       "Verify each finding" in (s := steps("done", V("REVIEWED", inline=finding)))
+       and "replying.md" in s, s)
+    ok("REVIEWED with nothing -> still read the overview, no reply pointer",
+       "read the overview" in (s := steps("done", V("REVIEWED"))) and "replying.md" not in s, s)
+    ok("an unanchored note alone still counts as a finding",
+       "Verify each finding" in (s := steps("done", V("REVIEWED", notes=["n"]))), s)
+    ok("STALE names the SHA its findings describe",
+       "bd27caf1" in (s := steps("stale", V("STALE", reviewed_sha=OLD, inline=finding))), s)
+    ok("FAILED on credentials -> an operator, not a retry",
+       "only an operator" in (s := steps("done", V("FAILED", detail="[credentials] x"))), s)
+    ok("FAILED on a generic error -> a fresh request may succeed",
+       "may succeed" in (s := steps("done", V("FAILED", detail="[generic] x"))), s)
+    for reason, want in [("nothing_new_since_last_review", "that review stands"),
+                         ("lost_on_restart", "nobody reviewed this"),
+                         ("superseded", "unreviewed")]:
+        ok(f"DECLINED {reason} -> {want!r}",
+           want in (s := steps("done", V("DECLINED", detail=f"[agent] no review is coming: {reason}"))), s)
+    ok("SKIPPED -> split the PR", "Split" in (s := steps("done", V("SKIPPED"))), s)
+    ok("TIMED_OUT -> never 'no issues found', and no review-state line",
+       "NOT an" in (s := steps("timed_out", V("PENDING"))) and "PENDING means" not in s, s)
+    ok("PENDING under --once says to run without it",
+       "without --once" in (s := steps("once", V("PENDING"))) and "NOT a pass" in s, s)
+    ok("PENDING on a closed PR says none is coming",
+       "PR is closed" in (s := steps("once", V("PENDING"), closed=True)), s)
+    ok("a failed CI next to a clean review is named, though the code is 0",
+       "CI FAILED" in (s := steps("done", V("REVIEWED"), CIVerdict("FAILED"))), s)
+    ok("  but not twice under ci_failed",
+       (s := steps("ci_failed", V("PENDING"), CIVerdict("FAILED"))).count("CI FAILED") == 1, s)
+    ok("CI still running at the deadline -> did not settle",
+       "CI did not settle" in (s := steps("ci_open", V("REVIEWED"), CIVerdict("RUNNING"))), s)
+    ok("CI passed -> no CI step at all", "CI" not in steps("done", V("REVIEWED")), None)
+
+    running = CIVerdict("RUNNING", "ci.yml/test: status=in_progress, running 3m12s")
+    later = CIVerdict("RUNNING", "ci.yml/test: status=in_progress, running 3m42s")
+    check("progress_key ignores the ticking clock",
+          poll_review.progress_key(V("PENDING"), running), poll_review.progress_key(V("PENDING"), later))
+    ok("  but not a change of state",
+       poll_review.progress_key(V("PENDING"), running) != poll_review.progress_key(V("PENDING"), PASSED), None)
+
+
 # ----------------------------------------------------------------- main loop
 
 
@@ -902,6 +951,8 @@ def _():
     code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(HEAD)] if n >= 4 else []))
     check("review lands on the third round -> exit 0", code, 0)
     check("  after two intervals", len(clock.sleeps), 2)
+    check("  printing the unchanged status line once, not every round", out.count("review=PENDING"), 1)
+    ok("  and ends with what to do next", ">> NEXT:" in out.split("=== REVIEWED")[-1], out)
 
     gitea = FakeGitea(
         reviews=lambda n: [review(HEAD, rid=5)],
@@ -1000,7 +1051,7 @@ def _():
 
     code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(OLD)]))
     check("deadline with only a STALE review -> 5, not TIMED_OUT", code, 5)
-    ok("  says it is real but old", "anchored to an older SHA" in out and "TIMED_OUT" not in out, out)
+    ok("  says it is real but old", "an older head" in out and "TIMED_OUT" not in out, out)
 
     code, out, clock = run_main(FakeGitea(
         reviews=lambda n: [review(HEAD)],
@@ -1039,6 +1090,7 @@ def _():
 
     code, out, clock = run_main(FakeGitea(author=BOT))
     check("bot-authored PR -> DECLINED at once", (code, clock.sleeps), (6, []))
+    ok("  and says the PR is unreviewed", ">> NEXT:" in out and "unreviewed" in out, out)
 
     code, out, clock = run_main(FakeGitea(jobs=lambda n: RUNNING_JOB), "--once")
     check("--once reports without waiting, exit 7", (code, clock.sleeps), (7, []))
