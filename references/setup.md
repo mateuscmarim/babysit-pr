@@ -9,7 +9,7 @@ PR opened from a fork is found in the upstream.
 | flag | default | |
 |---|---|---|
 | `--repo owner/name --pr N` | inferred | override the inference |
-| `--once` | off | check now and report; don't wait |
+| `--once` | off | check now and report; don't wait. A stuck Gitea call gives up after ~20s (10s per attempt, 2 attempts) instead of ~100s |
 | `--timeout-minutes` | 35 | the review budget. It restarts when the head moves |
 | `--interval` | 30 | seconds between polls |
 | `--no-fail-fast` | off | keep waiting for the review after CI has failed |

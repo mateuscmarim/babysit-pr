@@ -719,6 +719,20 @@ def _():
     ok("a 401 is raised at once", isinstance(got, urllib.error.HTTPError) and got.code == 401, repr(got))
     check("  ...not retried", sleeps, [])
 
+    got, _ = run(flaky([TimeoutError("read timed out")] * 5, b"[]"))
+    check("a give-up names the endpoint that failed, without the query",
+          poll_review.describe(got), "TimeoutError: read timed out on /x")
+    check("an error from elsewhere is described without one",
+          poll_review.describe(TimeoutError("t")), "TimeoutError: t")
+
+    timeouts = []
+
+    def record(req, timeout=None):
+        timeouts.append(timeout)
+        return _FakeResponse(b"[]")
+    run(record)
+    check("each attempt uses API_TIMEOUT_S", timeouts, [poll_review.API_TIMEOUT_S])
+
 
 @section("is_transient")
 def _():
@@ -929,8 +943,11 @@ def run_main(gitea, *args, agent=None):
     """main() against a fake Gitea and clock: (exit code, stdout, clock)."""
     clock = FakeClock()
     buf = io.StringIO()
+    # --once sets the module's API limits for the rest of the process. Patching
+    # them to their own values restores them, so the next test starts clean.
     with patched(poll_review, api=gitea, time=clock, token=lambda: "t",
-                 agent_state=lambda repo, pr, sha: agent, health=lambda: "up (test)"), \
+                 agent_state=lambda repo, pr, sha: agent, health=lambda: "up (test)",
+                 API_TIMEOUT_S=poll_review.API_TIMEOUT_S, API_RETRIES=poll_review.API_RETRIES), \
             contextlib.redirect_stdout(buf):
         code = poll_review.main(["--repo", "o/r", "--pr", "7",
                                  "--timeout-minutes", "5", "--interval", "30", *args])
@@ -1107,6 +1124,25 @@ def _():
 
     code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(HEAD, rid=5)]), "--once")
     check("--once, REVIEWED + CI passed -> exit 0", code, 0)
+
+    # Live, one stuck endpoint cost a --once run 101s: 3 attempts at 30s.
+    limits = []
+    gitea = FakeGitea(fail=lambda path, n: limits.append(
+        (poll_review.API_TIMEOUT_S, poll_review.API_RETRIES)) or None)
+    run_main(gitea, "--once")
+    check("--once asks Gitea with the short limits",
+          set(limits), {(poll_review.ONCE_API_TIMEOUT_S, poll_review.ONCE_API_RETRIES)})
+    limits.clear()
+    run_main(gitea)
+    check("  a waiting run keeps the long ones, and --once did not leak into it",
+          set(limits), {(30.0, 3)})
+
+    stuck = TimeoutError("The read operation timed out")
+    stuck.gitea_path = "/repos/o/r/actions/runs"  # pyright: ignore[reportAttributeAccessIssue]
+    code, out, clock = run_main(FakeGitea(
+        fail=lambda path, n: stuck if path == "/repos/o/r/pulls/7/reviews" else None), "--once")
+    ok("UNREACHABLE names the endpoint that timed out",
+       code == 1 and "timed out on /repos/o/r/actions/runs" in out, out)
     ok("  with no CI note", "CI has not settled" not in out, out)
 
 

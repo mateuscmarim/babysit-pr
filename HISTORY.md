@@ -4,6 +4,23 @@ The incidents behind the rules in `SKILL.md`. SKILL.md says what to do; this
 file says what went wrong when it was not done. Read it before loosening a
 rule. Newest first.
 
+## 2026-09-24: an outage made `--once` slow and nameless
+
+Testing the NEXT block live, one Gitea endpoint timed out for about two
+minutes. The `--once` run on `marim-harness#219` handled it correctly: it
+reported `UNREACHABLE`, exit 1 and "NOT a pass". It had two problems:
+
+- **It took 101s.** Each API call got 3 attempts at 30s each. That is fine in a
+  35-minute wait, but it pushed a foreground `--once` past the 120s tool
+  timeout. `--once` now uses 10s per attempt and 2 attempts, about 22s at
+  worst. Exit 1 means "could not look" either way.
+- **It did not say which call hung.** The error read only `TimeoutError: The
+  read operation timed out`, and a minute later Gitea answered in 0.03s, so
+  there was nothing left to check. A give-up now names the endpoint.
+
+The waiting path (skip the round, keep waiting) was not exercised by this
+outage. It is covered by the fake-Gitea tests only.
+
 ## 2026-09-24: the output says what to do next, and SKILL.md got short
 
 The goal is less for the model to hold in mind. Three changes:

@@ -564,6 +564,14 @@ def is_transient(exc: BaseException) -> bool:
 # broken minute cannot end a 35-minute wait with a traceback.
 API_RETRIES = 3
 API_RETRY_BACKOFF = 2.0
+# Per attempt. Three 30s attempts make one stuck endpoint cost ~100s, which
+# is fine inside a 35-minute wait. It is not fine for --once, which is meant
+# to answer in the foreground: live, one stuck endpoint ran it past a 120s
+# tool timeout. main() swaps in the ONCE_ limits, ~22s at worst. "Could not
+# look" is exit 1 either way, so giving up sooner loses nothing.
+API_TIMEOUT_S = 30.0
+ONCE_API_TIMEOUT_S = 10.0
+ONCE_API_RETRIES = 2
 
 
 def api(path: str, tok: str):
@@ -574,7 +582,7 @@ def api(path: str, tok: str):
     last: Exception | None = None
     for attempt in range(API_RETRIES):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT_S) as resp:
                 return json.loads(resp.read())
         except Exception as exc:
             if not is_transient(exc):
@@ -582,7 +590,18 @@ def api(path: str, tok: str):
             last = exc
         if attempt < API_RETRIES - 1:
             time.sleep(API_RETRY_BACKOFF * (attempt + 1))
-    raise last if last else RuntimeError(f"api({path}) failed with no error recorded")
+    if last is None:
+        raise RuntimeError(f"api({path}) failed with no error recorded")
+    # A bare "read operation timed out" does not say which call hung, and a
+    # minute later the endpoint may answer, leaving nothing to check.
+    setattr(last, "gitea_path", path.split("?")[0])
+    raise last
+
+
+def describe(exc: BaseException) -> str:
+    """A transport error as the reader needs it: what failed, and where."""
+    where = getattr(exc, "gitea_path", None)
+    return f"{type(exc).__name__}: {exc}" + (f" on {where}" if where else "")
 
 
 PAGE_LIMIT = 50
@@ -1131,6 +1150,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--full", action="store_true",
                     help="keep the per-file Reviewed changes table in the body")
     args = ap.parse_args(argv)
+    if args.once:
+        global API_TIMEOUT_S, API_RETRIES
+        API_TIMEOUT_S, API_RETRIES = ONCE_API_TIMEOUT_S, ONCE_API_RETRIES
 
     tok = token()
     branch = None if args.repo and args.pr else _git("rev-parse", "--abbrev-ref", "HEAD")
@@ -1240,7 +1262,7 @@ def main(argv: list[str] | None = None) -> int:
             # rather than die: a traceback where the verdict should be is the
             # wait ending with nothing decided.
             waited = int(time.monotonic() - started)
-            reason = f"{type(exc).__name__}: {exc}"
+            reason = describe(exc)
             # --once (or a closed PR) was never going to wait, so it does not
             # start now.
             if args.once or closed or time.monotonic() >= deadline:
@@ -1288,6 +1310,6 @@ if __name__ == "__main__":
     except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
         # Only reachable before the loop starts -- inside it, an outage skips
         # the round instead.
-        sys.exit(f"gitea unreachable ({type(exc).__name__}: {exc}) — no verdict reached")
+        sys.exit(f"gitea unreachable ({describe(exc)}) — no verdict reached")
     except KeyboardInterrupt:
         sys.exit("\ninterrupted — no verdict reached; do not treat this as a pass")
