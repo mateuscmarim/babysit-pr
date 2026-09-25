@@ -278,6 +278,19 @@ def _():
     check("running past the slow threshold -> still RUNNING", v.state, "RUNNING")
     ok("  overdue run flagged as possibly hung", "may be hung" in v.detail, v.detail)
 
+    # A job no runner picks up never gets a started_at. Without a clock of its
+    # own it sat at "status=queued" to the deadline, never flagged.
+    long_queued = datetime.fromtimestamp(
+        NOW.timestamp() - poll_review.CI_QUEUED_THRESHOLD_S - 60, tz=timezone.utc
+    ).isoformat().replace("+00:00", "Z")
+    v = classify_ci([{**job("queued"), "created_at": long_queued}], NOW)
+    check("queued past the threshold -> still RUNNING", v.state, "RUNNING")
+    ok("  but says no runner has picked it up", "no runner" in v.detail and "queued" in v.detail, v.detail)
+    v = classify_ci([{**job("queued"), "created_at": fresh}], NOW)
+    ok("  a freshly queued job is not flagged", "no runner" not in v.detail, v.detail)
+    v = classify_ci([job("queued", started="0001-01-01T00:00:00Z")], NOW)
+    ok("a zero started_at is not 'running since year 1'", "hung" not in v.detail, v.detail)
+
     v = classify_ci([job("completed", "success", name="tests"), job("completed", "failure", name="eval")], NOW)
     check("one failed among several -> FAILED", v.state, "FAILED")
     ok("  FAILED detail names only the failing job", "eval" in v.detail and "tests" not in v.detail, v.detail)
@@ -540,6 +553,15 @@ def _():
     check("only runs at another SHA -> []",
           ci_jobs(runs_then_jobs([{"id": 5, "path": "ci.yml@x", "head_sha": OLD}], {})), [])
 
+    # CI_WORKFLOW_FILE matches by file name whichever side carries a directory.
+    one_job = {6: [{"name": "t", "status": "completed", "conclusion": "success"}]}
+    check("filter given as a full path matches a bare run path",
+          len(ci_jobs(runs_then_jobs([{"id": 6, "path": "ci.yml@x"}], one_job),
+                      workflow_file=".gitea/workflows/ci.yml")), 1)
+    check("filter given as a file name matches a full run path",
+          len(ci_jobs(runs_then_jobs([{"id": 6, "path": ".gitea/workflows/ci.yml@x"}], one_job),
+                      workflow_file="ci.yml")), 1)
+
     # Jobs are paged: a matrix build can exceed one page.
     many = [{"id": i, "name": f"m{i}", "status": "completed", "conclusion": "success"} for i in range(51)]
 
@@ -627,7 +649,18 @@ def raises(exc):
 
 @section("agent_state transport")
 def _():
-    get = lambda: poll_review.agent_state("owner/name", 4, HEAD)
+    # Unset (the default) means "not configured": nothing is asked, and it
+    # must not be some unrelated service answering on localhost.
+    asked: list = []
+    with patched(poll_review, STATE_URL="", HEALTH_URL=""):
+        check("STATE_URL unset -> None", with_urlopen(lambda *a, **k: asked.append(a), lambda: poll_review.agent_state("owner/name", 4, HEAD)), None)
+        check("  without a request", asked, [])
+        ok("HEALTH_URL unset -> 'not configured'", "not configured" in poll_review.health(), poll_review.health())
+
+    def get():
+        with patched(poll_review, STATE_URL="http://agent.test/state"):
+            return poll_review.agent_state("owner/name", 4, HEAD)
+
     check("a JSON object comes back as a dict", with_urlopen(returns(b'{"verdict":"unknown"}'), get),
           {"verdict": "unknown"})
     for label, fake in [
@@ -710,6 +743,50 @@ def _():
           "owner/repo")
     check("another host -> None",
           poll_review.repo_from_remotes("origin\thttps://github.com/owner/repo.git (fetch)\n", base), None)
+    check("a host that merely ends in ours -> None",
+          poll_review.repo_from_remotes("origin\thttps://notgit.example.com/owner/repo.git (fetch)\n", base), None)
+
+    # A fork and its upstream, both on this Gitea. `git remote -v` sorts by
+    # name, so taking the first match picked `fork` over `origin`.
+    both = (
+        "fork\thttps://git.example.com/me/repo.git (fetch)\n"
+        "fork\thttps://git.example.com/me/repo.git (push)\n"
+        "origin\thttps://git.example.com/team/repo.git (fetch)\n"
+        "origin\thttps://git.example.com/team/repo.git (push)\n"
+        "zzz\thttps://github.com/team/repo.git (fetch)\n"
+    )
+    check("origin outranks an alphabetically earlier remote",
+          poll_review.remote_repos(both, base), ["team/repo", "me/repo"])
+    check("the branch's tracking remote outranks origin",
+          poll_review.remote_repos(both, base, prefer=("fork",)), ["me/repo", "team/repo"])
+
+
+@section("infer_pr")
+def _():
+    prs = {
+        "me/repo": [],
+        "team/repo": [
+            {"number": 3, "head": {"ref": "fix", "repo": {"full_name": "stranger/repo"}}},
+            {"number": 8, "head": {"ref": "fix", "repo": {"full_name": "me/repo"}}},
+        ],
+    }
+
+    def fake(path, tok):
+        repo = path.split("/repos/")[1].split("/pulls")[0]
+        return prs[repo] if "page=1&" in path else []
+
+    with patched(poll_review, api=fake):
+        check("a fork's PR is found in the next remote's repo",
+              poll_review.infer_pr(["me/repo", "team/repo"], "t", "fix"), ("team/repo", 8))
+        check("  and a stranger's same-named branch, listed first, is not it",
+              poll_review.infer_pr(["team/repo", "me/repo"], "t", "fix"), ("team/repo", 8))
+        check("--repo upstream still finds the PR from our own fork",
+              poll_review.infer_pr(["team/repo"], "t", "fix", ["me/repo", "team/repo"]), ("team/repo", 8))
+        try:
+            poll_review.infer_pr(["me/repo"], "t", "fix")
+            ok("no PR anywhere -> exits", False)
+        except SystemExit as exc:
+            ok("no PR anywhere -> exits naming the repos searched", "me/repo" in str(exc.code), exc.code)
 
 
 @section("tea_token")
@@ -833,6 +910,15 @@ def _():
     check("  inline comments fetched once, not every interval", gitea.inline_calls, 1)
     ok("  and printed with their thread id", "[#70 open] a.py:3" in out, out)
 
+    # A comment on a removed line has position 0 and the line in
+    # original_position. Printing `a.py:0` handed reply_finding a bad line.
+    code, out, clock = run_main(FakeGitea(
+        reviews=lambda n: [review(HEAD, rid=5)],
+        inline=lambda rid: [{"id": 71, "path": "a.py", "position": 0, "original_position": 9,
+                             "body": "gone", "resolver": None}]))
+    ok("an old-side comment prints its original line, marked",
+       "a.py:9 (old side" in out and "a.py:0" not in out, out)
+
     code, out, clock = run_main(
         FakeGitea(head=lambda n: OLD if n <= 2 else HEAD,
                   reviews=lambda n: [review(HEAD)] if n >= 3 else []))
@@ -890,6 +976,24 @@ def _():
     ok("  not an approval, with health and CI", "NOT an approval" in out and "up (test)" in out
        and "CI: PASSED" in out, out)
     ok("  offers the review-request lever", "requested_reviewers" in out, out)
+
+    # The curl uses $GITEA_TOKEN, which is unset when the token came from tea.
+    with patched(poll_review, os=types.SimpleNamespace(environ={})):
+        code, out, clock = run_main(FakeGitea())
+    ok("  says GITEA_TOKEN must be exported when it is not set", "GITEA_TOKEN is not set" in out, out)
+    with patched(poll_review, os=types.SimpleNamespace(environ={"GITEA_TOKEN": "x"})):
+        code, out, clock = run_main(FakeGitea())
+    ok("  and not when it is", "GITEA_TOKEN is not set" not in out, out)
+
+    with patched(poll_review, STATE_URL=""):
+        code, out, clock = run_main(FakeGitea())
+    ok("an unconfigured agent reads as not configured, not unreachable",
+       "NOT CONFIGURED" in out and "UNREACHABLE" not in out, out)
+
+    # Requested mid-wait: the TIMED_OUT hint must use what Gitea says now.
+    code, out, clock = run_main(FakeGitea(
+        pr=lambda n: {"requested_reviewers": [{"login": BOT}]} if n >= 2 else {}))
+    ok("requested_reviewers is re-read every round", "not a requested reviewer" not in out, out)
 
     code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(OLD)]))
     check("deadline with only a STALE review -> 5, not TIMED_OUT", code, 5)

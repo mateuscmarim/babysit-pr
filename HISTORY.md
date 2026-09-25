@@ -4,6 +4,41 @@ The incidents behind the rules in `SKILL.md`. SKILL.md says what to do; this
 file says what went wrong when it was not done. Read it before loosening a
 rule. Newest first.
 
+## 2026-09-24: the rest of the second review pass
+
+Smaller gaps from the same review. Each one has a test that failed before
+its fix.
+
+- **A queued job was never flagged.** A job no runner picks up has no
+  `started_at`, so it sat at `status=queued` until the deadline. It is now
+  flagged after `CI_QUEUED_THRESHOLD_S` (5 minutes, a guess rather than a
+  measured number) as having no runner. A zero-time `started_at` no longer
+  reads as a job running since year 1.
+- **The agent endpoints defaulted to `localhost:8000`.** Once the real hosts
+  came out of the defaults, that hit whatever dev server held the port. The
+  TIMED_OUT report then called that server the review agent, "up". The
+  endpoints are unset by default now, and unset reports `NOT CONFIGURED`,
+  which is distinct from `UNREACHABLE`.
+- **Remote inference took the first match.** `git remote -v` sorts by name,
+  so a `fork` remote beat `origin`, and a fork's PR (which lives in the
+  upstream) was never found. The poller now tries the tracking remote, then
+  `origin`, then the rest, and searches each one for the PR. A PR counts
+  only if its head repo is one of the checkout's remotes, so another
+  contributor's same-named branch is skipped. The host match no longer
+  accepts a longer hostname that merely ends in the configured one.
+- **The TIMED_OUT curl used `$GITEA_TOKEN`**, which is unset when the token
+  came from tea. The report now says so.
+- **Smaller fixes.**
+  - `CI_WORKFLOW_FILE` matches by file name.
+  - `requested_reviewers` is re-read every round.
+  - A comment on a removed line printed as `path:0`. It now prints its
+    original line, and `reply_finding.py` takes it as `--old-position`.
+  - `reply_finding.py` no longer requires `--comment-id` without
+    `--resolve`, and a network error no longer ends in a traceback. It also
+    says when the reply was posted but the resolve failed.
+  - `test_reply_finding.py` now records failures and keeps going, like the
+    poller's tests.
+
 ## 2026-09-24: `--once` exited 0 on a running CI, and another commit's run counted
 
 A second review pass. Each bug was reproduced against the `main()` harness

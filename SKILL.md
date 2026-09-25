@@ -27,7 +27,9 @@ minutes, well past the foreground timeout, and a background command notifies
 you when it exits. Then read the output file. Use one file per PR, or your
 scratchpad. Only `--once` is quick enough to run in the foreground.
 
-Repo and PR are inferred from the checkout's Gitea remote and branch. Flags:
+Repo and PR are inferred from the checkout's Gitea remotes and branch. The
+branch's tracking remote is tried first, then `origin`, then the rest, so a
+PR opened from a fork is found in the upstream. Flags:
 
 | flag | default | |
 |---|---|---|
@@ -42,10 +44,10 @@ Repo and PR are inferred from the checkout's Gitea remote and branch. Flags:
 |---|---|---|
 | `GITEA_BASE_URL` | `https://gitea.example.com` | your instance |
 | `GITEA_TOKEN` | the `tea` login whose `url` equals `GITEA_BASE_URL` | never another host's login |
-| `REVIEW_AGENT_STATE_URL` / `_HEALTH_URL` | `http://localhost:8000/state`, `/healthz` | the agent's own endpoints |
+| `REVIEW_AGENT_STATE_URL` / `_HEALTH_URL` | unset | the agent's own endpoints. Unset, the poller is Gitea-only and says `NOT CONFIGURED` |
 | `REVIEW_AGENT_STATE_TOKEN` | unset | only if the deployment sets `STATE_TOKEN` |
 | `REVIEW_BOT_USERNAME` | `review-bot` | |
-| `CI_WORKFLOW_FILE` / `CI_JOB_NAME` | unset (every run at head) | narrow CI to the one workflow or job that gates |
+| `CI_WORKFLOW_FILE` / `CI_JOB_NAME` | unset (every run at head) | narrow CI to the one workflow or job that gates. The file matches by name (`ci.yml`) |
 
 The poller only reads. It never merges, comments, resolves or edits.
 
@@ -62,7 +64,7 @@ the PR closes (a closed PR is reported once and never waited on anyway).
 | verdict | exit | meaning | what you do |
 |---|---|---|---|
 | `REVIEWED` | 0 | The newest bot review anchored to the **current head**. Findings are printed with thread id and open/resolved status. | Read the overview, the inline findings **and** the "unanchored finding(s)". Verify each against the code before acting on it. |
-| `UNREACHABLE` | 1 | Gitea stayed unreachable through the deadline (or under `--once`). Exit 1 is also a usage error. | No verdict. Not a pass. Retry when Gitea is back. |
+| `UNREACHABLE` | 1 | Gitea stayed unreachable through the deadline (or under `--once`). Exit 1 is also every error with no verdict at all: a usage error, a 401 or 404 from Gitea, Ctrl-C. | No verdict. Not a pass. Read the last line: retry when Gitea is back, or fix the token or `--repo`. |
 | `TIMED_OUT` | 2 | Nothing arrived within the budget, and the agent named no reason. It is still working, or could not be asked. Health and counters are printed. | **Not an approval.** `deliveries: 0` means the webhook never arrived. A nonzero `rejected_signature` means the secret is wrong. Re-request with the printed curl, or merge while saying plainly that it went in unreviewed. |
 | `FAILED` | 3 | The bot posted `⚠️`, or the agent reported a failure. `credentials`, `quota`, `oversized` and `backend_rejected` need an operator. `generic`, `backend_error` and `review_timeout` might pass on a fresh review request. | Fix the service, or merge knowing it is unreviewed. Never treat it as clean. |
 | `SKIPPED` | 4 | The diff is too large (`MAX_DIFF_LINES` 4000 / `MAX_DIFF_BYTES` 400000). No review is coming. | Split the PR, or review it yourself. |
@@ -87,7 +89,7 @@ per workflow and event**, and takes the worst result across all their jobs.
 |---|---|
 | `PASSED` | Every job succeeded. `skipped` and `neutral` jobs are listed as `(not gating)`. |
 | `FAILED` | At least one job completed without succeeding (`cancelled` included). It is named in the detail, and the wait stops. |
-| `RUNNING` | Something is queued or running. Past 15 minutes it is flagged as **possibly hung**. |
+| `RUNNING` | Something is queued or running. Running past 15 minutes is flagged as **possibly hung**. Queued past 5 minutes is flagged as **no runner has picked it up**, which usually means no online runner has the job's labels. |
 | `UNKNOWN` | **The poller could not read CI.** A 4xx (the token cannot read Actions, or Actions is off) is reported as-is. A 5xx or a timeout is retried until it clears. This is *not* "no CI". |
 | `NONE` | No run at this head, or every job was skipped. It counts as settled only after 90s of watching this head, because Gitea may not have created the run yet. |
 
@@ -122,12 +124,15 @@ the script does the JSON escaping that a hand-typed curl gets wrong:
 
 ```bash
 python3 ~/.claude/skills/babysit-pr/scripts/reply_finding.py \
-  --repo OWNER/REPO --pr N --comment-id ID --path app/x.py --position 355 \
-  --body "Fixed in abc1234: ..." [--resolve]
+  --repo OWNER/REPO --pr N --path app/x.py --position 355 \
+  --body "Fixed in abc1234: ..." [--comment-id ID --resolve]
 ```
 
-`--comment-id`, `--path` and `--position` come straight from the poller's
-inline output. **Resolving is an acknowledgment to the bot.** A resolved
+`--path`, `--position` and `--comment-id` come straight from the poller's
+inline output. A finding it marks `(old side)` sits on a removed line: pass
+that number as `--old-position` instead. If the resolve fails after the reply
+went out, the script says so. Check the thread before re-running, or the
+reply posts twice. **Resolving is an acknowledgment to the bot.** A resolved
 thread drops out of the PR view, and the bot stops re-checking that finding
 for good. So:
 

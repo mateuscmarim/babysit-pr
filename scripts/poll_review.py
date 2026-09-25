@@ -65,12 +65,11 @@ from datetime import datetime, timezone
 from gitea_auth import BASE_URL, token
 
 BOT = os.environ.get("REVIEW_BOT_USERNAME", "review-bot")
-HEALTH_URL = os.environ.get(
-    "REVIEW_AGENT_HEALTH_URL", "http://localhost:8000/healthz"
-)
-STATE_URL = os.environ.get(
-    "REVIEW_AGENT_STATE_URL", "http://localhost:8000/state"
-)
+# Unset by default, and unset means "not configured": the poller runs
+# Gitea-only and says so. A localhost default used to hit whatever dev server
+# held :8000, and the TIMED_OUT report called that the review agent, "up".
+HEALTH_URL = os.environ.get("REVIEW_AGENT_HEALTH_URL", "")
+STATE_URL = os.environ.get("REVIEW_AGENT_STATE_URL", "")
 # Only needed if the deployment sets STATE_TOKEN. Without it the endpoint 401s,
 # agent_state swallows it, and the poller degrades to Gitea-only -- which looks
 # exactly like "the agent is unreachable". That ambiguity is the thing this
@@ -87,6 +86,12 @@ CI_JOB_NAME = os.environ.get("CI_JOB_NAME")
 # flagged as possibly hung rather than just slow -- the job itself sets no
 # timeout-minutes, so nothing else will ever say so.
 CI_SLOW_THRESHOLD_S = 15 * 60
+
+# A job that never starts has no started_at, so the threshold above cannot
+# see it. Picking a job up normally takes seconds; this long in the queue
+# usually means no online runner carries the labels the job asks for. Not
+# calibrated against observed runs -- it only adds a note, never a verdict.
+CI_QUEUED_THRESHOLD_S = 5 * 60
 
 # How long a CI verdict of NONE has to hold before it counts as settled --
 # see `ci_settled`, which is where the reasoning lives.
@@ -168,17 +173,30 @@ def _job_state(job: dict, now: datetime) -> tuple[str, str]:
         if conclusion in ("skipped", "neutral"):
             return "SKIPPED", f"concluded {conclusion!r} (not gating)"
         return "FAILED", f"concluded {conclusion!r}"
-    started = parse_ts(job.get("started_at"))
     detail = f"status={status or '?'}"
-    if started != EPOCH:
+    # `> EPOCH`, not `!=`: an unset stamp can come back as Go's zero time
+    # (year 1), which is not EPOCH and read as running for two millennia.
+    if (started := parse_ts(job.get("started_at"))) > EPOCH:
         elapsed = int((now - started).total_seconds())
-        detail += f", running {elapsed // 60}m{elapsed % 60:02d}s"
+        detail += f", running {_mmss(elapsed)}"
         if elapsed > CI_SLOW_THRESHOLD_S:
             detail += (
                 " -- longer than any observed passing run (6-11m) and this "
                 "job sets no timeout-minutes; it may be hung, not just slow"
             )
+    elif (created := parse_ts(job.get("created_at"))) > EPOCH:
+        waiting = int((now - created).total_seconds())
+        detail += f", queued {_mmss(waiting)}"
+        if waiting > CI_QUEUED_THRESHOLD_S:
+            detail += (
+                " -- no runner has picked it up; check that a runner with "
+                "this job's labels is online"
+            )
     return "RUNNING", detail
+
+
+def _mmss(seconds: int) -> str:
+    return f"{seconds // 60}m{seconds % 60:02d}s"
 
 
 def classify_ci(jobs: list[dict], now: datetime) -> CIVerdict:
@@ -594,6 +612,8 @@ def api_paged(path: str, tok: str, key: str | None = None) -> list:
 
 
 def health() -> str:
+    if not HEALTH_URL:
+        return "not configured (set REVIEW_AGENT_HEALTH_URL)"
     try:
         with urllib.request.urlopen(HEALTH_URL, timeout=8) as resp:
             return f"up ({resp.read().decode().strip()})"
@@ -610,7 +630,9 @@ def agent_state(repo: str, pr: int, sha: str) -> dict | None:
 
     Returns None on any failure. An unreachable, unauthorised or
     not-yet-deployed agent must degrade to Gitea-only behaviour, never turn
-    into a verdict of its own."""
+    into a verdict of its own. So does an unconfigured one, without asking."""
+    if not STATE_URL:
+        return None
     url = (
         f"{STATE_URL}/{urllib.parse.quote(repo)}/{pr}"
         f"?sha={urllib.parse.quote(sha, safe='')}"
@@ -670,14 +692,16 @@ def ci_jobs(
         if (run_sha := r.get("head_sha")) and run_sha != sha:
             continue
         path = (r.get("path") or "").split("@", 1)[0]
-        if workflow_file is not None and path != workflow_file:
+        # By file name, whichever side carries a directory: Gitea reports the
+        # bare file name today, and CI_WORKFLOW_FILE may be given either way.
+        if workflow_file is not None and _basename(path) != _basename(workflow_file):
             continue
         k = (path, r.get("event"))
         if k not in latest or r["id"] > latest[k]["id"]:
             latest[k] = r
     jobs: list[dict] = []
     for run in sorted(latest.values(), key=lambda r: r["id"]):
-        workflow = ((run.get("path") or "?").split("@", 1)[0]).rsplit("/", 1)[-1]
+        workflow = _basename((run.get("path") or "?").split("@", 1)[0])
         try:
             listed = api_paged(
                 f"/repos/{repo}/actions/runs/{run['id']}/jobs", tok, key="jobs"
@@ -696,6 +720,10 @@ def ci_jobs(
                 continue
             jobs.append({**j, "_workflow": workflow})
     return jobs
+
+
+def _basename(path: str) -> str:
+    return path.rsplit("/", 1)[-1]
 
 
 def read_ci(repo: str, sha: str, tok: str, now: datetime) -> CIVerdict:
@@ -728,45 +756,79 @@ def read_ci(repo: str, sha: str, tok: str, now: datetime) -> CIVerdict:
     return classify_ci(jobs, now)
 
 
-def repo_from_remotes(remotes: str, base_url: str) -> str | None:
-    """owner/name from `git remote -v` output, for the remote on base_url's host.
+def remote_repos(remotes: str, base_url: str, prefer: tuple[str, ...] = ()) -> list[str]:
+    """Every owner/name on base_url's host in `git remote -v` output, best first.
 
     Matches on the hostname alone, with an optional port, so an https remote,
     an scp-style `git@host:owner/name` remote and an `ssh://git@host:2222/...`
-    remote all resolve."""
+    remote all resolve. The host must not be the tail of a longer name.
+
+    Order: the `prefer` remotes (the branch's tracking remote), then `origin`,
+    then the rest as git lists them. git sorts remotes by name, so taking the
+    first match picked a `fork` remote over `origin`."""
     host = urllib.parse.urlsplit(base_url).hostname or base_url.split("://", 1)[-1]
-    pattern = rf"{re.escape(host)}(?::\d+)?[:/]([\w.-]+/[\w.-]+?)(?:\.git)?\s"
-    match = re.search(pattern, remotes)
-    return match.group(1) if match else None
+    pattern = rf"(?<![\w.-]){re.escape(host)}(?::\d+)?[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$"
+    by_remote: dict[str, str] = {}
+    for line in remotes.splitlines():
+        name, _, rest = line.partition("\t")
+        url = rest.rsplit(" (", 1)[0].strip()
+        if name not in by_remote and (m := re.search(pattern, url)):
+            by_remote[name] = m.group(1)
+    ranked = [n for n in (*prefer, "origin") if n in by_remote]
+    ranked += [n for n in by_remote if n not in ranked]
+    return list(dict.fromkeys(by_remote[n] for n in ranked))
 
 
-def infer_repo() -> str:
-    """owner/name from the current checkout's Gitea remote."""
+def repo_from_remotes(remotes: str, base_url: str) -> str | None:
+    """The best owner/name from `remote_repos`, or None."""
+    return next(iter(remote_repos(remotes, base_url)), None)
+
+
+def _git(*args: str) -> str | None:
     try:
-        out = subprocess.run(
-            ["git", "remote", "-v"], capture_output=True, text=True, check=True
-        ).stdout
+        return subprocess.run(
+            ["git", *args], capture_output=True, text=True, check=True
+        ).stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
-        sys.exit("not a git checkout: pass --repo owner/name")
-    if repo := repo_from_remotes(out, BASE_URL):
-        return repo
-    sys.exit(f"no remote on {BASE_URL} found: pass --repo owner/name")
+        return None
 
 
-def infer_pr(repo: str, tok: str) -> int:
-    branch = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    # Paged for the same reason the reviews list is: an unpaged fetch silently
-    # gives up on PR #51 onward and reports "no open PR found", which reads as
-    # "you have no PR" rather than "I stopped looking".
-    for pr in api_paged(f"/repos/{repo}/pulls?state=open", tok):
-        if (pr.get("head") or {}).get("ref") == branch:
-            return pr["number"]
-    sys.exit(f"no open PR found for branch {branch!r}: pass --pr N")
+def local_repos(branch: str | None) -> list[str] | None:
+    """owner/name of each of the checkout's Gitea remotes, best first; None
+    outside a git checkout."""
+    remotes = _git("remote", "-v")
+    if remotes is None:
+        return None
+    tracking = _git("config", "--get", f"branch.{branch}.remote") if branch else None
+    return remote_repos(remotes + "\n", BASE_URL, prefer=(tracking,) if tracking else ())
+
+
+def infer_pr(
+    repos: list[str], tok: str, branch: str | None, ours: list[str] | None = None
+) -> tuple[str, int]:
+    """The open PR for `branch`, searched in each of `repos` in turn.
+
+    A fork's PR lives in the upstream repo, not in the fork the branch tracks,
+    so the first candidate alone is not enough. A PR only counts if its head
+    repo is one of `ours` (default: `repos`), the checkout's own remotes: in a
+    shared upstream, another contributor's same-named branch (`fix-typo`) is
+    not this checkout's PR."""
+    ours = repos if ours is None else [*repos, *ours]
+    if not branch or branch == "HEAD":
+        sys.exit("no branch checked out (detached HEAD): pass --pr N")
+    for repo in repos:
+        # Paged for the same reason the reviews list is: an unpaged fetch
+        # silently gives up on PR #51 onward and reports "no open PR found",
+        # which reads as "you have no PR" rather than "I stopped looking".
+        for pr in api_paged(f"/repos/{repo}/pulls?state=open", tok):
+            head = pr.get("head") or {}
+            head_repo = (head.get("repo") or {}).get("full_name")
+            if head.get("ref") == branch and head_repo in (None, *ours):
+                return repo, pr["number"]
+    sys.exit(
+        f"no open PR found for branch {branch!r} in {', '.join(repos)}: "
+        "pass --repo owner/name --pr N"
+    )
 
 
 def head_commit_date(repo: str, sha: str, tok: str) -> datetime | None:
@@ -830,10 +892,16 @@ def render(
             # addressable for a reply or a resolve downstream.
             who = (c.get("resolver") or {}).get("login")
             status = f"RESOLVED by {who}" if who else "open"
-            print(
-                f"\n[#{c.get('id')} {status}] "
-                f"{c.get('path')}:{c.get('new_position') or c.get('position')}"
-            )
+            # A comment on a removed line has no new-side position; its line
+            # is in original_position, and a reply has to say so.
+            if line := c.get("new_position") or c.get("position"):
+                where = f"{c.get('path')}:{line}"
+            else:
+                where = (
+                    f"{c.get('path')}:{c.get('original_position')} "
+                    "(old side: reply with --old-position)"
+                )
+            print(f"\n[#{c.get('id')} {status}] {where}")
             print((c.get("body") or "").strip())
     else:
         print("\n--- 0 inline comments ---")
@@ -855,7 +923,12 @@ def report_timed_out(
     print(f"\n=== TIMED_OUT — {repo}#{pr_num} @ {head[:8]} (waited {waited}s) ===")
     print(f"review agent health: {health()}")
     last = agent_state(repo, pr_num, head)
-    if last is None:
+    if not STATE_URL:
+        print(
+            "review agent state: NOT CONFIGURED — set REVIEW_AGENT_STATE_URL "
+            "to ask the agent why it is silent."
+        )
+    elif last is None:
         print(
             "review agent state: UNREACHABLE — this poller could not ask "
             "the agent what happened, so nothing below is decidable from "
@@ -897,6 +970,12 @@ def report_timed_out(
             f"    -d '{{\"reviewers\":[\"{BOT}\"]}}' \\\n"
             f"    {BASE_URL}/api/v1/repos/{repo}/pulls/{pr_num}/requested_reviewers"
         )
+        if not os.environ.get("GITEA_TOKEN"):
+            print(
+                "  (GITEA_TOKEN is not set in this shell: the poller read the "
+                f"tea login for {BASE_URL}.\n   Export that token first, or "
+                "the curl answers 401.)"
+            )
     render_ci(ci)
 
 
@@ -966,8 +1045,18 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     tok = token()
-    repo = args.repo or infer_repo()
-    pr_num = args.pr or infer_pr(repo, tok)
+    branch = None if args.repo and args.pr else _git("rev-parse", "--abbrev-ref", "HEAD")
+    local = local_repos(branch) if branch else None
+    if args.repo:
+        repos = [args.repo]
+    elif local is None:
+        sys.exit("not a git checkout: pass --repo owner/name")
+    elif not (repos := local):
+        sys.exit(f"no remote on {BASE_URL} found: pass --repo owner/name")
+    if args.pr:
+        repo, pr_num = repos[0], args.pr
+    else:
+        repo, pr_num = infer_pr(repos, tok, branch, local)
 
     pr = api(f"/repos/{repo}/pulls/{pr_num}", tok)
     head = pr["head"]["sha"]
@@ -1012,6 +1101,9 @@ def main(argv: list[str] | None = None) -> int:
                 commit_date = head_commit_date(repo, head, tok)
                 deadline = time.monotonic() + args.timeout_minutes * 60
                 watching_since = time.monotonic()
+            requested = BOT in [
+                r.get("login") for r in (pr.get("requested_reviewers") or [])
+            ]
             if pr.get("state") == "closed" and not closed:
                 closed = True
                 print(">> the PR was closed mid-wait — reporting what is known now")
@@ -1102,7 +1194,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except urllib.error.HTTPError as exc:
         sys.exit(f"gitea API {exc.code}: {exc.reason} ({exc.url})")
-    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+    except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
         # Only reachable before the loop starts -- inside it, an outage skips
         # the round instead.
         sys.exit(f"gitea unreachable ({type(exc).__name__}: {exc}) — no verdict reached")
