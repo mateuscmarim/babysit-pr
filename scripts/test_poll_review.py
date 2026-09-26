@@ -208,10 +208,17 @@ def _():
         ("quota", "⚠️ The reviewer has run out of model quota, so this pull request was not reviewed."),
         ("generic", FAILED_WARNING),
         ("oversized", "⚠️ This pull request is too large for the reviewer to accept, so it was not reviewed."),
+        # Worded apart from "generic" by the agent, and matched nothing here:
+        # the wait ran to TIMED_OUT on a bot that had already said it failed.
+        ("undetermined", "⚠️ The automated review did not complete, and the reviewer could not determine why."),
+        ("unrecognized", "⚠️ Some failure wording this poller has never seen."),
     ]:
         v = classify(HEAD, [], [comment(body)], EPOCH, BOT)
         check(f"{variant} warning -> FAILED", v.state, "FAILED")
         ok(f"  {variant} detail names the variant", v.detail.startswith(f"[{variant}]"), v.detail)
+
+    check("a bot comment without the warning sign is not a failure",
+          classify(HEAD, [], [comment("ℹ️ something informational")], EPOCH, BOT).state, "PENDING")
 
     # The floor guard: a warning that predates the current head commit is about
     # an earlier push and must not terminate this wait.
@@ -367,9 +374,11 @@ def _():
 def _():
     PASSED, FAILED, RUNNING, NONE = (CIVerdict(s) for s in ("PASSED", "FAILED", "RUNNING", "NONE"))
 
-    def d(review_state, ci, *, watched=0, past=False, once=False, fail_fast=True):
+    def d(review_state, ci, *, watched=0, past=False, once=False, fail_fast=True,
+          wait_for="both", new=False, was_open=False):
         return decide(review_state, ci, watched_s=watched, past_deadline=past,
-                      once=once, fail_fast=fail_fast)
+                      once=once, fail_fast=fail_fast, wait_for=wait_for,
+                      new_review=new, ci_was_open=was_open)
 
     for terminal in poll_review.REVIEW_DONE:
         ok(f"{terminal} has an exit code", terminal in EXIT)
@@ -386,6 +395,36 @@ def _():
     check("deadline, review decided, CI open -> ci_open", d("REVIEWED", RUNNING, past=True), "ci_open")
     check("deadline, STALE -> stale", d("STALE", PASSED, past=True), "stale")
     check("deadline, nothing -> timed_out", d("PENDING", PASSED, past=True), "timed_out")
+
+    # --wait-for any, the default: return on whichever side has news first.
+    for terminal in poll_review.REVIEW_DONE:
+        check(f"any: {terminal} while CI runs -> review", d(terminal, RUNNING, wait_for="any"), "review")
+    check("any: a new STALE review while CI runs -> review",
+          d("STALE", RUNNING, wait_for="any", new=True), "review")
+    check("any: a STALE review already there -> wait", d("STALE", RUNNING, wait_for="any"), "wait")
+    check("any: REVIEWED + NONE inside the grace -> wait it out",
+          d("REVIEWED", NONE, wait_for="any"), "wait")
+    check("any: CI finished during the run, review pending -> ci",
+          d("PENDING", PASSED, wait_for="any", was_open=True), "ci")
+    check("any: CI already passed at the start is not news -> wait",
+          d("PENDING", PASSED, wait_for="any"), "wait")
+    check("any: NONE past the grace is not news -> wait",
+          d("PENDING", NONE, watched=CI_NONE_GRACE_S, wait_for="any", was_open=True), "wait")
+    check("any: CI failed, review pending -> ci_failed, not ci",
+          d("PENDING", FAILED, wait_for="any", was_open=True), "ci_failed")
+    check("any: nothing yet -> wait", d("PENDING", RUNNING, wait_for="any"), "wait")
+    check("any: deadline, nothing -> timed_out", d("PENDING", PASSED, wait_for="any", past=True), "timed_out")
+    check("ci: settled already counts, it is what was asked for",
+          d("PENDING", PASSED, wait_for="ci"), "ci")
+    check("ci: a decided review alone -> wait", d("REVIEWED", RUNNING, wait_for="ci"), "wait")
+    check("ci: a new STALE review alone -> wait", d("STALE", RUNNING, wait_for="ci", new=True), "wait")
+    check("review: CI finishing alone -> wait",
+          d("PENDING", PASSED, wait_for="review", was_open=True), "wait")
+    check("review: a decided review -> review", d("FAILED", RUNNING, wait_for="review"), "review")
+    check("both: a decided review alone -> wait", d("REVIEWED", RUNNING, wait_for="both"), "wait")
+    check("exit: an early CI return with no review -> PENDING's 7", poll_review.exit_code("ci", "PENDING"), 7)
+    check("exit: an early review return keeps the review's code", poll_review.exit_code("review", "FAILED"), 3)
+    check("exit: a new STALE review -> 5", poll_review.exit_code("review", "STALE"), 5)
 
     check("exit: done uses the review's code", poll_review.exit_code("done", "FAILED"), 3)
     check("exit: PENDING from a run that did not wait -> 7, not TIMED_OUT's 2", poll_review.exit_code("once", "PENDING"), 7)
@@ -870,6 +909,21 @@ def _():
        "CI did not settle" in (s := steps("ci_open", V("REVIEWED"), CIVerdict("RUNNING"))), s)
     ok("CI passed -> no CI step at all", "CI" not in steps("done", V("REVIEWED")), None)
 
+    def early(action, verdict, ci):
+        return " | ".join(poll_review.next_steps(action, verdict, ci, watched_s=600,
+                                                 closed=False, rerun="poll --repo o/r --pr 7"))
+    ok("review first, CI running -> not a pass on CI, and how to wait for it",
+       "CI has not settled (RUNNING)" in (s := early("review", V("FAILED", detail="[credentials] x"),
+                                                      CIVerdict("RUNNING")))
+       and "`poll --repo o/r --pr 7 --wait-for ci`" in s, s)
+    ok("CI first, review pending -> NOT a pass, and how to wait for the review",
+       "NOT a pass" in (s := early("ci", V("PENDING"), PASSED))
+       and "--wait-for review" in s and "without --once" not in s, s)
+    ok("a new STALE review while CI runs -> wait for both",
+       "--wait-for any" in (s := early("review", V("STALE", reviewed_sha=OLD, inline=finding),
+                                       CIVerdict("RUNNING"))) and "bd27caf1" in s, s)
+    ok("nothing left open -> no re-run step", "--wait-for" not in steps("done", V("REVIEWED")), None)
+
     running = CIVerdict("RUNNING", "ci.yml/test: status=in_progress, running 3m12s")
     later = CIVerdict("RUNNING", "ci.yml/test: status=in_progress, running 3m42s")
     check("progress_key ignores the ticking clock",
@@ -976,8 +1030,8 @@ def _():
         jobs=lambda n: RUNNING_JOB if n < 5 else [{"name": "test", "status": "completed", "conclusion": "success"}],
         inline=lambda rid: [{"id": 70, "path": "a.py", "position": 3, "body": "leaks", "resolver": None}],
     )
-    code, out, clock = run_main(gitea)
-    check("REVIEWED holds open while CI runs, then exits 0", code, 0)
+    code, out, clock = run_main(gitea, "--wait-for", "both")
+    check("--wait-for both: REVIEWED holds open while CI runs, then exits 0", code, 0)
     check("  inline comments fetched once, not every interval", gitea.inline_calls, 1)
     ok("  and printed with their thread id", "[#70 open] a.py:3" in out, out)
 
@@ -1013,7 +1067,8 @@ def _():
 
     code, out, clock = run_main(FakeGitea(
         reviews=lambda n: [review(HEAD)],
-        fail=lambda path, n: http_error(502) if path == "/repos/o/r/actions/runs" and n < 4 else None))
+        fail=lambda path, n: http_error(502) if path == "/repos/o/r/actions/runs" and n < 4 else None),
+        "--wait-for", "both")
     check("a transient CI API error holds the wait until it clears", (code, len(clock.sleeps)), (0, 2))
     ok("  and ends PASSED", "CI: PASSED" in out, out)
 
@@ -1035,9 +1090,66 @@ def _():
     check("--no-fail-fast waits the review out", code, 2)
     ok("  to the TIMED_OUT block", "=== TIMED_OUT" in out and len(clock.sleeps) > 0, out)
 
-    code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(HEAD)], jobs=lambda n: RUNNING_JOB))
+    code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(HEAD)], jobs=lambda n: RUNNING_JOB),
+                                "--wait-for", "ci")
     check("deadline, review decided, CI running -> review's code", code, 0)
     ok("  with the did-not-settle note", "CI did not settle" in out, out)
+
+
+@section("main: return on either side")
+def _():
+    # twm-android#17: the credentials warning landed at 32s, and the poller
+    # held it until CI finished at 2184s.
+    warning = "⚠️ The reviewer's credentials are not working, so this pull request was not reviewed."
+    code, out, clock = run_main(FakeGitea(
+        comments=lambda n: [comment(warning, at=13)] if n >= 3 else [],
+        jobs=lambda n: RUNNING_JOB))
+    check("a bot failure while CI runs -> returns on it, exit 3", (code, len(clock.sleeps)), (3, 1))
+    ok("  says CI is still open and how to wait for it",
+       "CI: RUNNING" in out and "--repo o/r --pr 7 --wait-for ci`" in out, out)
+
+    code, out, clock = run_main(FakeGitea(
+        comments=lambda n: [comment("ℹ️ This PR's diff is too large to review automatically.", at=13)],
+        jobs=lambda n: RUNNING_JOB))
+    check("SKIPPED already there, CI running -> returns at once, exit 4", (code, clock.sleeps), (4, []))
+
+    code, out, clock = run_main(FakeGitea(
+        reviews=lambda n: [review(HEAD, rid=5)], jobs=lambda n: RUNNING_JOB,
+        inline=lambda rid: [{"id": 70, "path": "a.py", "position": 3, "body": "leaks", "resolver": None}]))
+    check("REVIEWED while CI runs -> returns at once, exit 0", (code, clock.sleeps), (0, []))
+    ok("  with the findings", "[#70 open] a.py:3" in out, out)
+
+    code, out, clock = run_main(FakeGitea(jobs=lambda n: RUNNING_JOB if n < 4 else
+                                          [{"name": "test", "status": "completed", "conclusion": "success"}]))
+    check("CI passes first -> returns on it, PENDING's 7", (code, len(clock.sleeps)), (7, 2))
+    ok("  NOT a pass, and how to wait for the review",
+       "NOT a pass" in out and "--wait-for review" in out and "CI: PASSED" in out, out)
+
+    code, out, clock = run_main(FakeGitea(jobs=lambda n: RUNNING_JOB if n < 4 else FAILED_JOB))
+    check("CI fails first -> 8, as before", (code, len(clock.sleeps)), (8, 2))
+
+    gitea = FakeGitea(
+        reviews=lambda n: [review(OLD, rid=9, body=STALE_BODY)] if n >= 4 else [],
+        jobs=lambda n: RUNNING_JOB,
+        inline=lambda rid: [{"id": 77, "path": "a.py", "position": 3, "body": "old finding", "resolver": None}])
+    code, out, clock = run_main(gitea)
+    check("a review of a head pushed past lands mid-wait -> returns, 5", (code, len(clock.sleeps)), (5, 2))
+    ok("  with its findings, and how to keep waiting for both",
+       "old finding" in out and "--wait-for any" in out, out)
+
+    code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(OLD, rid=9)], jobs=lambda n: RUNNING_JOB))
+    check("a STALE review already there is not news -> waits to the deadline",
+          (code, sum(clock.sleeps) >= 5 * 60), (5, True))
+
+    code, out, clock = run_main(FakeGitea(
+        reviews=lambda n: [review(HEAD, rid=5)],
+        jobs=lambda n: RUNNING_JOB if n < 4 else [{"name": "test", "status": "completed", "conclusion": "success"}]),
+        "--wait-for", "ci")
+    check("--wait-for ci skips the review it was sent back for", (code, len(clock.sleeps)), (0, 2))
+
+    code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(HEAD)] if n >= 4 else []),
+                                "--wait-for", "review")
+    check("--wait-for review with CI done waits for the review", (code, len(clock.sleeps)), (0, 2))
 
 
 @section("main: deadline and outages")

@@ -1,8 +1,9 @@
 # babysit-pr
 
 A Claude Code skill. Waits for `review-bot` (the `gitea-review-agent` companion
-project) to finish reviewing a PR on your Gitea instance **and** for that PR's
-CI to reach a final state, reports what each found, and stops.
+project) to review a PR on your Gitea instance and for that PR's CI to reach a
+final state. It returns as soon as **either** has news, reports what each
+found, and says how to wait for the one still open.
 
 It exists because the bot cannot block a merge: `build_review_payload`
 hardcodes `"event": "COMMENT"`, never `APPROVE` or `REQUEST_CHANGES`, so branch
@@ -18,8 +19,10 @@ contract in `references/replying.md`, each read only when needed.
 ## The flow
 
 The review and CI are two independent verdicts. One loop polls both, and
-neither waits on the other. The loop returns only when **both** have settled,
-or when one of the escape hatches below fires first.
+neither waits on the other. By default (`--wait-for any`) the loop returns on
+whichever side has news first, so the reader can act on a finding while CI is
+still running, or fix a red CI before the review lands. `--wait-for review`,
+`ci` or `both` narrow that; `both` is the old "return only once both settled".
 
 ```mermaid
 flowchart TD
@@ -47,9 +50,13 @@ flowchart TD
     I -->|yes| IX(["the review's own exit code<br/>REVIEWED 0 · FAILED 3<br/>SKIPPED 4 · DECLINED 6"])
     I -->|no| J{"--once or PR closed?"}
     J -->|yes| JX(["report what is known now, do not wait<br/>the review's code, or PENDING · exit 7<br/>+ a NEXT step if CI has not settled"])
-    J -->|no| K{"CI FAILED?<br/>unless --no-fail-fast"}
+    J -->|no| RV{"review has news?<br/>decided, or a new bot review<br/>(--wait-for any / review)"}
+    RV -->|yes| RVX(["the review's code, or STALE 5<br/>+ NEXT: CI has not settled,<br/>re-run with --wait-for ci"])
+    RV -->|no| K{"CI FAILED?<br/>unless --no-fail-fast"}
     K -->|yes| KX(["CI_FAILED · exit 8<br/>bail early; a STALE review's<br/>findings are still fetched first"])
-    K -->|no| L{"past the deadline?"}
+    K -->|no| CV{"CI finished during this run?<br/>(--wait-for any / ci)"}
+    CV -->|yes| CVX(["PENDING 7, or STALE 5<br/>+ NEXT: NOT a pass,<br/>re-run with --wait-for review"])
+    CV -->|no| L{"past the deadline?"}
     L -->|no| M["print a status line if anything changed,<br/>sleep --interval"]
     M --> D
 
@@ -62,8 +69,13 @@ flowchart TD
     I -.- Z["ci_settled: RUNNING never settles.<br/>PASSED and FAILED settle at once.<br/>UNKNOWN settles only on a 4xx;<br/>a transport error holds the wait.<br/>NONE only after 90s watching this head,<br/>since Gitea may not have created the run yet."]
 ```
 
-Five things this shape depends on:
+Six things this shape depends on:
 
+- **Control comes back on the first news, not the last.** Waiting for both
+  sides held a bot failure posted at 32s until CI finished at 2184s. Each early
+  return names the one command that waits for the side still open. A CI that
+  had already passed when the run began, and a STALE review that was already
+  there, are not news: returning on them would send the reader straight back.
 - **Once the review decides, the code is the review's.** CI gets its own
   block. `PASSED` CI next to a `FAILED` review is still exit 3, and a failed
   CI next to a `REVIEWED` is still 0, so read both blocks, not the number.
@@ -74,8 +86,8 @@ Five things this shape depends on:
   `UNKNOWN`, not `NONE`. A Gitea that stays down is `UNREACHABLE`, not
   `TIMED_OUT`.
 - **Every code means one thing.** Stopping early has codes of its own:
-  `PENDING` (7) when a run did not wait, `CI_FAILED` (8) when CI failed
-  before the review decided. They used to borrow 2 and 5, so exit 2 could
+  `PENDING` (7) when the run returned before the review said anything,
+  `CI_FAILED` (8) when CI failed before the review decided. They used to borrow 2 and 5, so exit 2 could
   mean `TIMED_OUT`, "did not wait" or "CI failed first".
 - **The output says what to do next.** Every exit path ends with a `>> NEXT:`
   block written for that result: verify these findings, fix CI first, this

@@ -27,17 +27,24 @@ None of the jobs set `timeout-minutes`, so a hang reports as RUNNING with a
 growing elapsed time, not as a failure. A CI API that cannot be read is
 UNKNOWN, never NONE: "I could not look" is not "there is nothing to see".
 
+By default (--wait-for any) the wait ends on whichever side has news first:
+the review decides, a new bot review lands (even one of a head since pushed
+past), or CI finishes. The reader gets control back to act on it, and the NEXT
+block gives the command that waits for the side still open. --wait-for review
+or ci waits for one side only, and --wait-for both for both.
+
 Each exit code means one thing. 0 REVIEWED, 3 FAILED, 4 SKIPPED, 5 STALE and
 6 DECLINED are the review's verdict; 2 TIMED_OUT is the deadline with nothing
-from the bot. Two more say why the poller stopped without one: 7 PENDING, a
-run that did not wait (--once, a closed PR) and found nothing yet; 8
-CI_FAILED, CI failed before the review decided. 1 is everything with no
-verdict at all: Gitea unreachable to the deadline, a usage error, a 4xx.
+from the bot. Two more say why the poller stopped without one: 7 PENDING, the
+run returned before the review said anything (CI finished first, --once, a
+closed PR); 8 CI_FAILED, CI failed before the review decided. 1 is everything
+with no verdict at all: Gitea unreachable to the deadline, a usage error, a
+4xx.
 
 Once the review has decided, CI never changes the code: a REVIEWED next to a
-failed CI is still 0, and the CI block says the rest. The two checks fail in
-unrelated ways, and folding them together would make "what do you do"
-ambiguous for both.
+failed or still-running CI is still 0, and the CI block says the rest. The two
+checks fail in unrelated ways, and folding them together would make "what do
+you do" ambiguous for both.
 
 A FAILED CI verdict before that point stops the *wait* (--no-fail-fast keeps
 waiting) and exits 8, whatever the undecided review looked like. A failed job
@@ -116,8 +123,14 @@ FAIL_MARKERS = {
     # from SKIP_MARKER, which is the agent's own line-count guard declining
     # before it ever calls a backend.
     "oversized": "too large for the reviewer to accept",
+    # A failure the agent could not name. Worded apart from "generic" on
+    # purpose, so it matched no marker here and the wait ran to TIMED_OUT.
+    "undetermined": "automated review did not complete",
     "generic": "Automated review failed",
 }
+# Every failure notice opens with it. A notice whose wording this list has not
+# caught up with still ends the wait, as FAILED, instead of being ignored.
+FAIL_PREFIX = "⚠️"
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -441,6 +454,8 @@ def classify(
         for variant, marker in FAIL_MARKERS.items():
             if marker in body:
                 return Verdict(state="FAILED", detail=f"[{variant}] {body.strip()}")
+        if body.lstrip().startswith(FAIL_PREFIX):
+            return Verdict(state="FAILED", detail=f"[unrecognized] {body.strip()}")
 
     if (from_agent := agent_verdict(state, head_sha)) is not None:
         return from_agent
@@ -486,6 +501,10 @@ def signal_floor(head_commit_date: datetime | None, reviews: list[dict], bot: st
 
 REVIEW_DONE = ("REVIEWED", "SKIPPED", "FAILED", "DECLINED")
 
+# What a waiting run returns on. `any` is the default: the reader wants control
+# back the moment there is something to act on, not when both sides are done.
+WAIT_FOR = ("any", "review", "ci", "both")
+
 
 def decide(
     review_state: str,
@@ -495,25 +514,52 @@ def decide(
     past_deadline: bool,
     once: bool,
     fail_fast: bool,
+    wait_for: str = "both",
+    new_review: bool = False,
+    ci_was_open: bool = False,
 ) -> str:
     """What the loop does with one poll's two verdicts. Pure, so every branch
     of the loop is testable without a clock or a network.
 
       done       both sides settled -- exit with the review's code
       once       --once, or a closed PR -- report what is known now
+      review     the review side has news, CI is still open (wait_for any/review)
+      ci         CI settled, the review is still undecided (wait_for any/ci)
       ci_failed  CI FAILED while the review is undecided -- stop waiting
       ci_open    deadline; review decided, CI not settled
       stale      deadline; only an older-SHA review exists
       timed_out  deadline; nothing at all
       wait       poll again
+
+    The review side has news when it has decided, or when `new_review` says a
+    bot review landed during this run. That covers the STALE review of a head
+    already pushed past: it carries findings, and waiting the deadline out on
+    it hid them for 35 minutes. A decided review holds only while CI is NONE
+    inside its grace: 90s at most buys a CI line that says something.
+
+    CI has news under `ci` once it settles. Under `any` it has news only when
+    it finished during this run (`ci_was_open`): a CI that had already passed
+    when the run started tells the reader nothing to act on, and returning on
+    it would just send them back to wait for the review. NONE is never news
+    under `any`: nothing finished, the grace just ran out. A failed CI is
+    always news, through `ci_failed`.
     """
     review_done = review_state in REVIEW_DONE
-    if review_done and ci_settled(ci, watched_s):
+    settled = ci_settled(ci, watched_s)
+    if review_done and settled:
         return "done"
     if once:
         return "once"
+    in_grace = ci.state == "NONE" and not settled
+    if wait_for in ("any", "review") and (review_done or new_review) and not in_grace:
+        return "review"
     if fail_fast and ci.state == "FAILED":
         return "ci_failed"
+    if settled and (
+        wait_for == "ci"
+        or (wait_for == "any" and ci_was_open and ci.state != "NONE")
+    ):
+        return "ci"
     if past_deadline:
         if review_done:
             return "ci_open"
@@ -996,6 +1042,7 @@ def report_timed_out(
     render_ci(ci)
 
 
+SCRIPT = os.path.abspath(__file__)
 REPLYING_DOC = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "references", "replying.md"
 )
@@ -1005,7 +1052,13 @@ OPERATOR_FAILURES = ("credentials", "quota", "oversized", "backend_rejected")
 
 
 def next_steps(
-    action: str, verdict: Verdict, ci: CIVerdict, *, watched_s: float, closed: bool
+    action: str,
+    verdict: Verdict,
+    ci: CIVerdict,
+    *,
+    watched_s: float,
+    closed: bool,
+    rerun: str = "python3 poll_review.py",
 ) -> list[str]:
     """What to do now, for this result only. It is the last thing a run prints.
 
@@ -1030,6 +1083,11 @@ def next_steps(
             "poller. The review has decided nothing: this is not a pass.",
             "To wait for review-bot anyway, pass --no-fail-fast.",
         ]
+    elif state == "PENDING" and action == "ci":
+        steps.append(
+            "CI settled first. No review has landed for this head yet: PENDING "
+            "means \"nothing yet\". It is NOT a pass."
+        )
     elif state == "PENDING":
         why = (
             "the PR is closed, so no review is coming"
@@ -1098,7 +1156,12 @@ def next_steps(
             "code is the review's and does not say this."
         )
     elif not ci_settled(ci, watched_s):
-        if action == "once":
+        if action == "review":
+            steps.append(
+                f"CI has not settled ({ci.state}). Do not merge on the assumption "
+                "it passed."
+            )
+        elif action == "once":
             how = "check the run directly" if closed else "check the run, or re-run without --once"
             steps.append(
                 f"CI has not settled ({ci.state}) and this run did not wait for it. "
@@ -1117,6 +1180,22 @@ def next_steps(
             f"Before replying to a finding, resolving a thread or filing an "
             f"issue, read {REPLYING_DOC}."
         )
+
+    # An early return leaves the other side open. Say how to wait for exactly
+    # that, so a re-run does not return at once on what was just reported.
+    if action in ("review", "ci"):
+        review_open = state not in REVIEW_DONE
+        ci_open = not ci_settled(ci, watched_s)
+        if review_open or ci_open:
+            wait_for, what = (
+                ("any", "the review of this head and CI") if review_open and ci_open
+                else ("review", "the review of this head") if review_open
+                else ("ci", "CI")
+            )
+            steps.append(
+                f"To keep waiting for {what}, run `{rerun} --wait-for "
+                f"{wait_for}` in the background, as before."
+            )
     return steps
 
 
@@ -1145,11 +1224,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timeout-minutes", type=float, default=35.0)
     ap.add_argument("--interval", type=float, default=30.0)
     ap.add_argument("--once", action="store_true", help="check once, do not wait")
+    ap.add_argument("--wait-for", choices=WAIT_FOR,
+                    help="return when the review has news or CI settles (any, the "
+                         "default), on only one of them (review, ci), or only "
+                         "once both have (both)")
     ap.add_argument("--no-fail-fast", action="store_true",
-                    help="keep waiting for the review even after CI has failed")
+                    help="keep waiting for the review even after CI has failed "
+                         "(implies --wait-for review)")
     ap.add_argument("--full", action="store_true",
                     help="keep the per-file Reviewed changes table in the body")
     args = ap.parse_args(argv)
+    # A failed CI is a CI event, so under `any` --no-fail-fast would change
+    # nothing. What it asks for is to wait for the review.
+    wait_for = args.wait_for or ("review" if args.no_fail_fast else "any")
     if args.once:
         global API_TIMEOUT_S, API_RETRIES
         API_TIMEOUT_S, API_RETRIES = ONCE_API_TIMEOUT_S, ONCE_API_RETRIES
@@ -1202,6 +1289,14 @@ def main(argv: list[str] | None = None) -> int:
     # "has THIS head had time to trigger a run", so a new head restarts it.
     watching_since = time.monotonic()
     last_progress: tuple[str, ...] = ()
+    # Bot reviews already there on the first poll. One that lands later is news
+    # even when it is STALE: the bot reviewed a head since pushed past.
+    seen_reviews: set | None = None
+    # Whether this run has seen the head's CI unsettled: only then is its
+    # settling something that happened while the reader waited.
+    ci_was_open = False
+    # How the reader re-runs this for the side still open, repo and PR pinned.
+    rerun = f"python3 {SCRIPT} --repo {repo} --pr {pr_num}"
 
     while True:
         try:
@@ -1215,6 +1310,7 @@ def main(argv: list[str] | None = None) -> int:
                 commit_date = head_commit_date(repo, head, tok)
                 deadline = time.monotonic() + args.timeout_minutes * 60
                 watching_since = time.monotonic()
+                ci_was_open = False
             requested = BOT in [
                 r.get("login") for r in (pr.get("requested_reviewers") or [])
             ]
@@ -1224,6 +1320,11 @@ def main(argv: list[str] | None = None) -> int:
 
             reviews = api_paged(f"/repos/{repo}/pulls/{pr_num}/reviews", tok)
             comments = api_paged(f"/repos/{repo}/issues/{pr_num}/comments", tok)
+            bot_review_ids = {
+                r.get("id") for r in reviews if (r.get("user") or {}).get("login") == BOT
+            }
+            if seen_reviews is None:
+                seen_reviews = bot_review_ids
             floor = signal_floor(commit_date, reviews, BOT)
             # Consulted every interval rather than once: a job can be enqueued,
             # superseded and declined between two polls.
@@ -1240,7 +1341,11 @@ def main(argv: list[str] | None = None) -> int:
                 past_deadline=now >= deadline,
                 once=args.once or closed,
                 fail_fast=not args.no_fail_fast,
+                wait_for=wait_for,
+                new_review=bool(bot_review_ids - seen_reviews),
+                ci_was_open=ci_was_open,
             )
+            ci_was_open |= not ci_settled(ci_verdict, now - watching_since)
             # Every action but waiting renders the verdict, and a REVIEWED or
             # STALE review's inline comments are the half a reader most needs.
             # Fetched here, once, rather than every interval while CI holds the
@@ -1294,7 +1399,8 @@ def main(argv: list[str] | None = None) -> int:
             render(verdict, repo, pr_num, head, waited, args.full)
             render_ci(ci_verdict)
         render_next(next_steps(action, verdict, ci_verdict,
-                               watched_s=now - watching_since, closed=closed))
+                               watched_s=now - watching_since, closed=closed,
+                               rerun=rerun))
         return exit_code(action, verdict.state)
 
 

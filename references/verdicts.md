@@ -13,16 +13,33 @@ when you have to explain a verdict to someone.
 | `TIMED_OUT` | 2 | Nothing arrived within the budget, and the agent named no reason. It is still working, or could not be asked. Health and counters are printed. | **Not an approval.** `deliveries: 0` means the webhook never arrived. A nonzero `rejected_signature` means the secret is wrong. Re-request with the printed curl, or merge while saying plainly that it went in unreviewed. |
 | `FAILED` | 3 | The bot posted `⚠️`, or the agent reported a failure. `credentials`, `quota`, `oversized` and `backend_rejected` need an operator. `generic`, `backend_error` and `review_timeout` might pass on a fresh review request. | Fix the service, or merge knowing it is unreviewed. Never treat it as clean. |
 | `SKIPPED` | 4 | The diff is too large (`MAX_DIFF_LINES` 4000 / `MAX_DIFF_BYTES` 400000). No review is coming. | Split the PR, or review it yourself. |
-| `STALE` | 5 | The only review is for an **older SHA**, because you pushed since. Its findings are printed in full under a banner naming that SHA. | Read them, since they usually still apply. The poller keeps waiting and exits 5 only at the deadline or under `--once`. |
+| `STALE` | 5 | The only review is for an **older SHA**, because you pushed since. Its findings are printed in full under a banner naming that SHA. | Read them, since they usually still apply. The poller returns on one when it lands during the wait. One that was already there when the wait started is not news: that wait exits 5 only at the deadline or under `--once`. |
 | `DECLINED` | 6 | The agent says no review is coming for this SHA, and why: diff empty after `SKIP_PATHS`, `nothing_new_since_last_review`, superseded, a bot-authored PR, `lost_on_restart`… | Read the reason. `nothing_new…` means the last review stands. `lost_on_restart` means nobody reviewed this, so re-request. |
-| `PENDING` | 7 | Only from a run that did not wait: `--once`, or a closed PR. Nothing has landed for this head yet. | **Not a pass.** Run without `--once` to wait. A closed PR gets no new review. |
+| `PENDING` | 7 | The run returned before the review said anything: CI finished first, `--once`, or a closed PR. Nothing has landed for this head yet. | **Not a pass.** Run the `--wait-for review` command from NEXT, or run without `--once`. A closed PR gets no new review. |
 | `CI_FAILED` | 8 | CI failed before the review decided, so the poller stopped waiting. The review's state is printed: pending, or `STALE` with its findings in full. | Fix CI and push, which restarts the review too. Pass `--no-fail-fast` to wait for the review anyway. |
 
 **Once the review has decided, CI never changes the code.** `CI_FAILED` (8)
 fires only while the review is still undecided. A `REVIEWED` next to a failed
-CI exits 0, and the CI block and the NEXT block say the rest. `--once` does
-not wait for CI either: a `REVIEWED` next to a running CI exits 0 with a "CI
-has not settled" step.
+CI exits 0, and the CI block and the NEXT block say the rest.
+
+## When the wait returns
+
+By default (`--wait-for any`) the poller returns at the first of these:
+
+- **The review decides**: a review of the head, a skip or failure notice, or a
+  decline from the agent. It holds for up to 90s only while CI reads `NONE`,
+  so the CI line says something.
+- **A new bot review lands**, even one of an older head (`STALE`). One that
+  was already there when the run started does not count.
+- **CI finishes during the run.** A CI that had already passed when the run
+  started is not news, and `NONE` never is. A failed CI always is (exit 8).
+
+So a `REVIEWED` next to a running CI exits 0 with a "CI has not settled"
+step, and a CI that passed first exits 7. In both cases the last NEXT step is
+the command that waits for the side still open: `--wait-for ci` returns once
+CI has settled, even if it already has; `--wait-for review` ignores CI unless
+it fails. `--wait-for both` is the old behavior: return only once both have
+settled. `--once` never waits for either.
 
 ## CI verdicts
 

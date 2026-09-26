@@ -4,6 +4,48 @@ The incidents behind the rules in `SKILL.md`. SKILL.md says what to do; this
 file says what went wrong when it was not done. Read it before loosening a
 rule. Newest first.
 
+## 2026-09-26: the bot spoke and nobody heard for half an hour
+
+The poller returned only once the review **and** CI had both settled. Four
+runs on `trainwithme/twm-android` on 2026-09-25 show what that cost:
+
+- `#17`: the credentials `⚠️` landed at 32s, and the run returned at 2184s,
+  when `tests.yml` finished.
+- `#18`: the same notice was there at 0s, and the run returned at 779s. On a
+  later head it arrived at 131s, and the run returned at 1755s.
+- `#19`: the diff-too-large notice was there at 1s, and the run returned at
+  854s.
+
+Each time the agent sat idle for 12 to 36 minutes on news it could have acted
+on. It works the other way too: a CI that finished in 10 minutes waited for a
+review 20 minutes behind it. The default is now `--wait-for any`. The run
+returns on whichever side has news first, and NEXT gives the command that
+waits for the side still open (`--wait-for review` or `ci`). `--wait-for
+both` keeps the old behavior.
+
+Three edges needed decisions:
+
+- **What was already there is not news.** A CI that had passed before the run
+  started, or a STALE review already on the PR, would return at once and send
+  the reader straight back to wait. A decided review always counts, since its
+  findings are what the reader is waiting for. So does a new STALE review
+  landing mid-wait: it is the "previous-head trap" from 2026-08-28, whose
+  findings used to wait out the full 35 minutes.
+- **`NONE` never ends a wait under `any`.** Nothing finished; the grace ran
+  out. A decided review holds up to 90s while CI reads `NONE` inside its
+  grace, so the report does not claim "CI not settled" for a run that was
+  about to appear.
+- **`--no-fail-fast` now implies `--wait-for review`.** Under `any` a failed CI
+  is itself a CI event, so the flag would have changed nothing.
+
+**A failure notice the poller could not read.** Reading `worker.py` for this
+change turned up a fifth failure wording: "⚠️ The automated review did not
+complete, and the reviewer could not determine why." It matched no marker, so
+the poller read it as PENDING and waited to TIMED_OUT on a bot that had
+already said it failed. It is now the `undetermined` marker. Any other bot
+comment that opens with `⚠️` reads as FAILED `[unrecognized]`, so a future
+rewording cannot go silent again.
+
 ## 2026-09-24: cold agents filled the wait with busywork
 
 Two fresh agents, one per model, were given only a "babysit this PR"
