@@ -298,6 +298,23 @@ def _():
     v = classify_ci([job("queued", started="0001-01-01T00:00:00Z")], NOW)
     ok("a zero started_at is not 'running since year 1'", "hung" not in v.detail, v.detail)
 
+    # twm-android#18: Gitea reported a gate job's started_at ahead of now, and
+    # the poller printed "running -1m34s".
+    def ahead(seconds):
+        return datetime.fromtimestamp(NOW.timestamp() + seconds, tz=timezone.utc
+                                      ).isoformat().replace("+00:00", "Z")
+    v = classify_ci([job("in_progress", started=ahead(94))], NOW)
+    ok("a started_at in the future is never a negative time",
+       not re.search(r"-\d", v.detail) and "just started" in v.detail
+   and "1m34s ahead" in v.detail, v.detail)
+    v = classify_ci([{**job("queued"), "created_at": ahead(94)}], NOW)
+    ok("  nor is a created_at in the future",
+       not re.search(r"-\d", v.detail) and "just queued" in v.detail, v.detail)
+    check("  and the ticking gap does not make a new status line",
+          poll_review.progress_key(poll_review.Verdict("PENDING"), v),
+          poll_review.progress_key(poll_review.Verdict("PENDING"),
+                                   classify_ci([{**job("queued"), "created_at": ahead(119)}], NOW)))
+
     v = classify_ci([job("completed", "success", name="tests"), job("completed", "failure", name="eval")], NOW)
     check("one failed among several -> FAILED", v.state, "FAILED")
     ok("  FAILED detail names only the failing job", "eval" in v.detail and "tests" not in v.detail, v.detail)

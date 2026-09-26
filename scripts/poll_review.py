@@ -194,7 +194,7 @@ def _job_state(job: dict, now: datetime) -> tuple[str, str]:
     # (year 1), which is not EPOCH and read as running for two millennia.
     if (started := parse_ts(job.get("started_at"))) > EPOCH:
         elapsed = int((now - started).total_seconds())
-        detail += f", running {_mmss(elapsed)}"
+        detail += f", {_since('running', 'just started', elapsed)}"
         if elapsed > CI_SLOW_THRESHOLD_S:
             detail += (
                 " -- longer than any observed passing run (6-11m) and this "
@@ -202,7 +202,7 @@ def _job_state(job: dict, now: datetime) -> tuple[str, str]:
             )
     elif (created := parse_ts(job.get("created_at"))) > EPOCH:
         waiting = int((now - created).total_seconds())
-        detail += f", queued {_mmss(waiting)}"
+        detail += f", {_since('queued', 'just queued', waiting)}"
         if waiting > CI_QUEUED_THRESHOLD_S:
             detail += (
                 " -- no runner has picked it up; check that a runner with "
@@ -213,6 +213,18 @@ def _job_state(job: dict, now: datetime) -> tuple[str, str]:
 
 def _mmss(seconds: int) -> str:
     return f"{seconds // 60}m{seconds % 60:02d}s"
+
+
+def _since(verb: str, fresh: str, elapsed: int) -> str:
+    """`running 3m12s`, or `fresh` when the stamp is later than this clock.
+
+    Gitea stamps jobs with its own clock (or the runner's), so a job that just
+    started can read as starting in the future. Live on twm-android#18 that
+    printed "running -1m34s": 26s of skew, since floor division turns -26
+    into -1m34s. The skew is named rather than hidden."""
+    if elapsed >= 0:
+        return f"{verb} {_mmss(elapsed)}"
+    return f"{fresh} (Gitea's clock is {_mmss(-elapsed)} ahead of this one)"
 
 
 def classify_ci(jobs: list[dict], now: datetime) -> CIVerdict:

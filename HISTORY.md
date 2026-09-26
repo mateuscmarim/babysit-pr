@@ -46,6 +46,13 @@ already said it failed. It is now the `undetermined` marker. Any other bot
 comment that opens with `⚠️` reads as FAILED `[unrecognized]`, so a future
 rewording cannot go silent again.
 
+**"running -1m34s".** On the same `#18` run, the gate job read `running
+-1m34s` and then `-1m59s`. Gitea had stamped `started_at` 26s and 1s ahead of
+the local clock, and floor division turned -26s into -1m34s. Every clock
+involved agreed under NTP afterwards, so the skew was transient. A stamp ahead
+of this clock now reads `just started (Gitea's clock is 0m26s ahead of this
+one)`, or `just queued` for `created_at`. The time is never shown as negative.
+
 ## 2026-09-24: cold agents filled the wait with busywork
 
 Two fresh agents, one per model, were given only a "babysit this PR"
