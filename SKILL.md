@@ -22,7 +22,9 @@ python3 ~/.claude/skills/babysit-pr/scripts/poll_review.py > /tmp/babysit-REPO-P
 Use the Bash tool's `run_in_background: true`: the wait runs up to 35
 minutes, and you are notified when it exits. It exits at the first of: the
 review decides (a review, a skip or failure notice, a decline), a new bot
-review lands (even one of an older head), or CI finishes. After starting it, **end your
+review lands (even one of an older head), or CI finishes. A review with no
+findings is the exception: it waits for CI, since there is nothing to act on
+before CI answers. After starting it, **end your
 turn** and wait for that notification. Don't monitor, poll or `tail -f` the
 file, and don't make placeholder calls (`echo waiting`, `true`, `sleep`) to
 pass the time. When notified, read the output file once. `--once` checks

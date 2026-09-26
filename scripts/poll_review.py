@@ -29,7 +29,8 @@ UNKNOWN, never NONE: "I could not look" is not "there is nothing to see".
 
 By default (--wait-for any) the wait ends on whichever side has news first:
 the review decides, a new bot review lands (even one of a head since pushed
-past), or CI finishes. The reader gets control back to act on it, and the NEXT
+past), or CI finishes. A review with no findings is not news on its own and
+waits for CI. The reader gets control back to act on it, and the NEXT
 block gives the command that waits for the side still open. --wait-for review
 or ci waits for one side only, and --wait-for both for both.
 
@@ -529,6 +530,7 @@ def decide(
     wait_for: str = "both",
     new_review: bool = False,
     ci_was_open: bool = False,
+    clean: bool = False,
 ) -> str:
     """What the loop does with one poll's two verdicts. Pure, so every branch
     of the loop is testable without a clock or a network.
@@ -549,6 +551,13 @@ def decide(
     it hid them for 35 minutes. A decided review holds only while CI is NONE
     inside its grace: 90s at most buys a CI line that says something.
 
+    Under `any`, a `clean` review (no inline comment, no unanchored note) is
+    not news on its own: there is nothing to act on while CI runs, and the
+    question it leaves, "can this merge?", is CI's to answer. Returning on it
+    only sent the reader back to wait with `--wait-for ci`, holding an exit 0
+    that is easy to read as "done". It holds for CI instead, which still
+    returns the moment CI fails. `--wait-for review` returns on it as before.
+
     CI has news under `ci` once it settles. Under `any` it has news only when
     it finished during this run (`ci_was_open`): a CI that had already passed
     when the run started tells the reader nothing to act on, and returning on
@@ -563,7 +572,8 @@ def decide(
     if once:
         return "once"
     in_grace = ci.state == "NONE" and not settled
-    if wait_for in ("any", "review") and (review_done or new_review) and not in_grace:
+    review_news = (review_done or new_review) and not (clean and wait_for == "any")
+    if wait_for in ("any", "review") and review_news and not in_grace:
         return "review"
     if fail_fast and ci.state == "FAILED":
         return "ci_failed"
@@ -1324,6 +1334,10 @@ def main(argv: list[str] | None = None) -> int:
     # in HeadWatch: one that lands later is news even when it is STALE, since
     # the bot reviewed a head since pushed past.
     seen_reviews: set | None = None
+    # Review id -> its inline comments. The bot never adds to a submitted
+    # review, so whether it has any is fixed once fetched; only a thread's
+    # resolved status can change, which is refreshed before printing.
+    inline: dict[int, list[dict]] = {}
     # How the reader re-runs this for the side still open, repo and PR pinned.
     rerun = f"python3 {SCRIPT} --repo {repo} --pr {pr_num}"
 
@@ -1358,6 +1372,15 @@ def main(argv: list[str] | None = None) -> int:
                 agent_state(repo, pr_num, watch.head),
             )
             ci_verdict = read_ci(repo, watch.head, tok, datetime.now(timezone.utc))
+            # Fetched when the review lands rather than when the run returns:
+            # whether it has findings decides whether it returns at all.
+            rid = verdict.review_id
+            has_review = rid is not None and verdict.state in ("REVIEWED", "STALE")
+            fetched_now = has_review and rid not in inline
+            if fetched_now:
+                inline[rid] = api_paged(
+                    f"/repos/{repo}/pulls/{pr_num}/reviews/{rid}/comments", tok
+                )
 
             now = time.monotonic()
             action = decide(
@@ -1370,22 +1393,19 @@ def main(argv: list[str] | None = None) -> int:
                 wait_for=wait_for,
                 new_review=bool(bot_review_ids - seen_reviews),
                 ci_was_open=watch.ci_was_open,
+                clean=has_review and not inline[rid] and not verdict.notes,
             )
             watch.ci_was_open |= not ci_settled(ci_verdict, now - watch.since)
             # Every action but waiting renders the verdict, and a REVIEWED or
             # STALE review's inline comments are the half a reader most needs.
-            # Fetched here, once, rather than every interval while CI holds the
-            # loop open.
-            if (
-                action not in ("wait", "timed_out")
-                and verdict.review_id is not None
-                and verdict.state in ("REVIEWED", "STALE")
-            ):
-                verdict.inline = api_paged(
-                    f"/repos/{repo}/pulls/{pr_num}/reviews/"
-                    f"{verdict.review_id}/comments",
-                    tok,
-                )
+            # Re-read once if they were fetched rounds ago, so a thread resolved
+            # while CI held the loop open does not print as open.
+            if action not in ("wait", "timed_out") and has_review:
+                if inline[rid] and not fetched_now:
+                    inline[rid] = api_paged(
+                        f"/repos/{repo}/pulls/{pr_num}/reviews/{rid}/comments", tok
+                    )
+                verdict.inline = inline[rid]
         except Exception as exc:
             if not is_transient(exc):
                 raise

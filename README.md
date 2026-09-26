@@ -50,7 +50,7 @@ flowchart TD
     I -->|yes| IX(["the review's own exit code<br/>REVIEWED 0 · FAILED 3<br/>SKIPPED 4 · DECLINED 6"])
     I -->|no| J{"--once or PR closed?"}
     J -->|yes| JX(["report what is known now, do not wait<br/>the review's code, or PENDING · exit 7<br/>+ a NEXT step if CI has not settled"])
-    J -->|no| RV{"review has news?<br/>decided, or a new bot review<br/>(--wait-for any / review)"}
+    J -->|no| RV{"review has news?<br/>decided, or a new bot review,<br/>with findings under any<br/>(--wait-for any / review)"}
     RV -->|yes| RVX(["the review's code, or STALE 5<br/>+ NEXT: CI has not settled,<br/>re-run with --wait-for ci"])
     RV -->|no| K{"CI FAILED?<br/>unless --no-fail-fast"}
     K -->|yes| KX(["CI_FAILED · exit 8<br/>bail early; a STALE review's<br/>findings are still fetched first"])
@@ -74,8 +74,9 @@ Six things this shape depends on:
 - **Control comes back on the first news, not the last.** Waiting for both
   sides held a bot failure posted at 32s until CI finished at 2184s. Each early
   return names the one command that waits for the side still open. A CI that
-  had already passed when the run began, and a STALE review that was already
-  there, are not news: returning on them would send the reader straight back.
+  had already passed when the run began, a STALE review that was already
+  there, and a review with no findings are not news: returning on them would
+  send the reader straight back.
 - **Once the review decides, the code is the review's.** CI gets its own
   block. `PASSED` CI next to a `FAILED` review is still exit 3, and a failed
   CI next to a `REVIEWED` is still 0, so read both blocks, not the number.

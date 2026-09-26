@@ -392,10 +392,10 @@ def _():
     PASSED, FAILED, RUNNING, NONE = (CIVerdict(s) for s in ("PASSED", "FAILED", "RUNNING", "NONE"))
 
     def d(review_state, ci, *, watched=0, past=False, once=False, fail_fast=True,
-          wait_for="both", new=False, was_open=False):
+          wait_for="both", new=False, was_open=False, clean=False):
         return decide(review_state, ci, watched_s=watched, past_deadline=past,
                       once=once, fail_fast=fail_fast, wait_for=wait_for,
-                      new_review=new, ci_was_open=was_open)
+                      new_review=new, ci_was_open=was_open, clean=clean)
 
     for terminal in poll_review.REVIEW_DONE:
         ok(f"{terminal} has an exit code", terminal in EXIT)
@@ -438,6 +438,18 @@ def _():
     check("review: CI finishing alone -> wait",
           d("PENDING", PASSED, wait_for="review", was_open=True), "wait")
     check("review: a decided review -> review", d("FAILED", RUNNING, wait_for="review"), "review")
+
+    # A review with no findings leaves nothing to do while CI runs.
+    check("any: a clean REVIEWED while CI runs -> wait for CI",
+          d("REVIEWED", RUNNING, wait_for="any", new=True, clean=True), "wait")
+    check("  then done once CI passes", d("REVIEWED", PASSED, wait_for="any", clean=True), "done")
+    check("  or the moment it fails", d("REVIEWED", FAILED, wait_for="any", clean=True), "done")
+    check("  and ci_open at the deadline",
+          d("REVIEWED", RUNNING, wait_for="any", clean=True, past=True), "ci_open")
+    check("any: a new clean STALE review -> wait",
+          d("STALE", RUNNING, wait_for="any", new=True, clean=True), "wait")
+    check("review: a clean REVIEWED still returns at once",
+          d("REVIEWED", RUNNING, wait_for="review", clean=True), "review")
     check("both: a decided review alone -> wait", d("REVIEWED", RUNNING, wait_for="both"), "wait")
     check("exit: an early CI return with no review -> PENDING's 7", poll_review.exit_code("ci", "PENDING"), 7)
     check("exit: an early review return keeps the review's code", poll_review.exit_code("review", "FAILED"), 3)
@@ -1045,12 +1057,15 @@ def _():
     gitea = FakeGitea(
         reviews=lambda n: [review(HEAD, rid=5)],
         jobs=lambda n: RUNNING_JOB if n < 5 else [{"name": "test", "status": "completed", "conclusion": "success"}],
-        inline=lambda rid: [{"id": 70, "path": "a.py", "position": 3, "body": "leaks", "resolver": None}],
+        inline=lambda rid: [{"id": 70, "path": "a.py", "position": 3, "body": "leaks",
+                             "resolver": {"login": "me"} if gitea.inline_calls > 1 else None}],
     )
     code, out, clock = run_main(gitea, "--wait-for", "both")
     check("--wait-for both: REVIEWED holds open while CI runs, then exits 0", code, 0)
-    check("  inline comments fetched once, not every interval", gitea.inline_calls, 1)
-    ok("  and printed with their thread id", "[#70 open] a.py:3" in out, out)
+    check("  inline comments fetched when the review lands and before printing, "
+          "not every interval", gitea.inline_calls, 2)
+    ok("  and printed with their thread id, resolved while CI ran",
+       "[#70 RESOLVED by me] a.py:3" in out, out)
 
     # A comment on a removed line has position 0 and the line in
     # original_position. Printing `a.py:0` handed reply_finding a bad line.
@@ -1147,6 +1162,29 @@ def _():
         inline=lambda rid: [{"id": 70, "path": "a.py", "position": 3, "body": "leaks", "resolver": None}]))
     check("REVIEWED while CI runs -> returns at once, exit 0", (code, clock.sleeps), (0, []))
     ok("  with the findings", "[#70 open] a.py:3" in out, out)
+
+    gitea = FakeGitea(reviews=lambda n: [review(HEAD, rid=5)],
+                      jobs=lambda n: RUNNING_JOB if n < 4 else
+                      [{"name": "test", "status": "completed", "conclusion": "success"}])
+    code, out, clock = run_main(gitea)
+    check("a review with no findings holds for CI, then exits 0", (code, len(clock.sleeps)), (0, 2))
+    ok("  printing it once, with CI's result and no re-run step",
+       out.count("=== REVIEWED") == 1 and "0 inline comments" in out and "CI: PASSED" in out
+       and "No inline or unanchored findings" in out and "--wait-for" not in out, out)
+    check("  its empty inline list fetched once", gitea.inline_calls, 1)
+
+    code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(HEAD, rid=5)],
+                                          jobs=lambda n: RUNNING_JOB if n < 4 else FAILED_JOB))
+    check("  and returns the moment CI fails, on the review's 0",
+          (code, len(clock.sleeps), "CI: FAILED" in out), (0, 2, True))
+
+    code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(HEAD, rid=5, body=STALE_BODY)],
+                                          jobs=lambda n: RUNNING_JOB))
+    check("unanchored notes alone are findings -> returns at once", (code, clock.sleeps), (0, []))
+
+    code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(HEAD, rid=5)],
+                                          jobs=lambda n: RUNNING_JOB), "--wait-for", "review")
+    check("--wait-for review returns on a clean review at once", (code, clock.sleeps), (0, []))
 
     code, out, clock = run_main(FakeGitea(jobs=lambda n: RUNNING_JOB if n < 4 else
                                           [{"name": "test", "status": "completed", "conclusion": "success"}]))

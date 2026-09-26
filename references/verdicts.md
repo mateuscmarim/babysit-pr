@@ -31,14 +31,17 @@ By default (`--wait-for any`) the poller returns at the first of these:
   so the CI line says something.
 - **A new bot review lands**, even one of an older head (`STALE`). One that
   was already there when the run started does not count.
+- **Except a review with no findings**: no inline comment and no unanchored
+  note. It leaves nothing to do while CI runs, so it holds until CI settles
+  and returns once, with both. A failed CI still returns at once.
 - **CI finishes during the run.** A CI that had already passed when the run
   started is not news, and `NONE` never is. A failed CI always is (exit 8).
 
-So a `REVIEWED` next to a running CI exits 0 with a "CI has not settled"
-step, and a CI that passed first exits 7. In both cases the last NEXT step is
+So a `REVIEWED` with findings next to a running CI exits 0 with a "CI has not
+settled" step, and a CI that passed first exits 7. In both cases the last NEXT step is
 the command that waits for the side still open: `--wait-for ci` returns once
 CI has settled, even if it already has; `--wait-for review` ignores CI unless
-it fails. `--wait-for both` is the old behavior: return only once both have
+it fails, and returns on a review with no findings too. `--wait-for both` is the old behavior: return only once both have
 settled. `--once` never waits for either.
 
 ## CI verdicts

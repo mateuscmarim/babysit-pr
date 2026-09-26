@@ -53,6 +53,21 @@ involved agreed under NTP afterwards, so the skew was transient. A stamp ahead
 of this clock now reads `just started (Gitea's clock is 0m26s ahead of this
 one)`, or `just queued` for `created_at`. The time is never shown as negative.
 
+**A clean review is not news.** Returning on the first review was right for
+findings, which the reader can work on while CI runs. A review with no inline
+comment and no unanchored note left nothing to do. The reader was handed exit
+0 with CI still running, and a "do not merge yet" step that was easy to miss,
+and had to start a second wait with `--wait-for ci` to learn whether the PR
+could merge. Under `any` such a review now holds for CI and returns once,
+with both answers. A failed CI still ends the wait at once. The trade-off is
+accepted: a defect named only in the overview prose is read when CI settles
+(6-11m on the observed runs), not the moment the review lands.
+
+To know whether a review has findings before deciding, the poller now fetches
+its inline comments when it lands, once per review id. A review with findings
+that then holds for CI (`--wait-for both`) is re-read before printing, so a
+thread resolved during the wait does not print as open.
+
 ## 2026-09-24: cold agents filled the wait with busywork
 
 Two fresh agents, one per model, were given only a "babysit this PR"
