@@ -1229,6 +1229,28 @@ def progress_key(verdict: Verdict, ci: CIVerdict) -> tuple[str, ...]:
     return (verdict.state, verdict.detail, ci.state, undated)
 
 
+@dataclass
+class HeadWatch:
+    """What the wait tracks for one head. A push mid-wait replaces the whole
+    thing rather than resetting fields one by one, so a field added here
+    restarts with the head without anyone having to remember it."""
+
+    head: str
+    commit_date: datetime | None
+    deadline: float
+    # The CI grace window asks "has THIS head had time to trigger a run", so it
+    # counts from here, not from the start of the run.
+    since: float
+    # Whether this head's CI has been seen unsettled: only then is its settling
+    # something that happened while the reader waited.
+    ci_was_open: bool = False
+
+    @classmethod
+    def start(cls, repo: str, head: str, tok: str, timeout_s: float) -> HeadWatch:
+        now = time.monotonic()
+        return cls(head, head_commit_date(repo, head, tok), now + timeout_s, now)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", help="owner/name (default: infer from git remote)")
@@ -1269,7 +1291,6 @@ def main(argv: list[str] | None = None) -> int:
 
     pr = api(f"/repos/{repo}/pulls/{pr_num}", tok)
     head = pr["head"]["sha"]
-    commit_date = head_commit_date(repo, head, tok)
     # NB: only the single-PR endpoint populates requested_reviewers. The list
     # endpoint returns [] for every PR, which reads as "nobody was asked".
     requested = BOT in [
@@ -1295,18 +1316,14 @@ def main(argv: list[str] | None = None) -> int:
         render_next(next_steps("done", declined, ci, watched_s=0, closed=closed))
         return EXIT["DECLINED"]
 
-    deadline = time.monotonic() + args.timeout_minutes * 60
+    timeout_s = args.timeout_minutes * 60
     started = time.monotonic()
-    # Reset on every head move, same as the deadline: the CI grace window asks
-    # "has THIS head had time to trigger a run", so a new head restarts it.
-    watching_since = time.monotonic()
+    watch = HeadWatch.start(repo, head, tok, timeout_s)
     last_progress: tuple[str, ...] = ()
-    # Bot reviews already there on the first poll. One that lands later is news
-    # even when it is STALE: the bot reviewed a head since pushed past.
+    # Bot reviews already there on the first poll. Kept across head moves, not
+    # in HeadWatch: one that lands later is news even when it is STALE, since
+    # the bot reviewed a head since pushed past.
     seen_reviews: set | None = None
-    # Whether this run has seen the head's CI unsettled: only then is its
-    # settling something that happened while the reader waited.
-    ci_was_open = False
     # How the reader re-runs this for the side still open, repo and PR pinned.
     rerun = f"python3 {SCRIPT} --repo {repo} --pr {pr_num}"
 
@@ -1314,15 +1331,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             pr = api(f"/repos/{repo}/pulls/{pr_num}", tok)
             current = pr["head"]["sha"]
-            if current != head:
+            if current != watch.head:
                 # A push landed mid-wait. A review anchored to the old SHA says
                 # nothing about what would now be merged, so restart the clock.
-                print(f"\n>> head moved {head[:8]} -> {current[:8]}; restarting the wait")
-                head = current
-                commit_date = head_commit_date(repo, head, tok)
-                deadline = time.monotonic() + args.timeout_minutes * 60
-                watching_since = time.monotonic()
-                ci_was_open = False
+                print(f"\n>> head moved {watch.head[:8]} -> {current[:8]}; restarting the wait")
+                watch = HeadWatch.start(repo, current, tok, timeout_s)
             requested = BOT in [
                 r.get("login") for r in (pr.get("requested_reviewers") or [])
             ]
@@ -1337,27 +1350,28 @@ def main(argv: list[str] | None = None) -> int:
             }
             if seen_reviews is None:
                 seen_reviews = bot_review_ids
-            floor = signal_floor(commit_date, reviews, BOT)
+            floor = signal_floor(watch.commit_date, reviews, BOT)
             # Consulted every interval rather than once: a job can be enqueued,
             # superseded and declined between two polls.
             verdict = classify(
-                head, reviews, comments, floor, BOT, agent_state(repo, pr_num, head)
+                watch.head, reviews, comments, floor, BOT,
+                agent_state(repo, pr_num, watch.head),
             )
-            ci_verdict = read_ci(repo, head, tok, datetime.now(timezone.utc))
+            ci_verdict = read_ci(repo, watch.head, tok, datetime.now(timezone.utc))
 
             now = time.monotonic()
             action = decide(
                 verdict.state,
                 ci_verdict,
-                watched_s=now - watching_since,
-                past_deadline=now >= deadline,
+                watched_s=now - watch.since,
+                past_deadline=now >= watch.deadline,
                 once=args.once or closed,
                 fail_fast=not args.no_fail_fast,
                 wait_for=wait_for,
                 new_review=bool(bot_review_ids - seen_reviews),
-                ci_was_open=ci_was_open,
+                ci_was_open=watch.ci_was_open,
             )
-            ci_was_open |= not ci_settled(ci_verdict, now - watching_since)
+            watch.ci_was_open |= not ci_settled(ci_verdict, now - watch.since)
             # Every action but waiting renders the verdict, and a REVIEWED or
             # STALE review's inline comments are the half a reader most needs.
             # Fetched here, once, rather than every interval while CI holds the
@@ -1382,9 +1396,9 @@ def main(argv: list[str] | None = None) -> int:
             reason = describe(exc)
             # --once (or a closed PR) was never going to wait, so it does not
             # start now.
-            if args.once or closed or time.monotonic() >= deadline:
+            if args.once or closed or time.monotonic() >= watch.deadline:
                 print(
-                    f"\n=== UNREACHABLE — {repo}#{pr_num} @ {head[:8]} "
+                    f"\n=== UNREACHABLE — {repo}#{pr_num} @ {watch.head[:8]} "
                     f"(waited {waited}s) ===\nGitea could not be read ({reason})."
                 )
                 render_next(["No verdict was reached. This is NOT a pass: re-run once Gitea answers."])
@@ -1406,12 +1420,12 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(args.interval)
             continue
         if action == "timed_out":
-            report_timed_out(repo, pr_num, head, waited, requested, ci_verdict)
+            report_timed_out(repo, pr_num, watch.head, waited, requested, ci_verdict)
         else:
-            render(verdict, repo, pr_num, head, waited, args.full)
+            render(verdict, repo, pr_num, watch.head, waited, args.full)
             render_ci(ci_verdict)
         render_next(next_steps(action, verdict, ci_verdict,
-                               watched_s=now - watching_since, closed=closed,
+                               watched_s=now - watch.since, closed=closed,
                                rerun=rerun))
         return exit_code(action, verdict.state)
 

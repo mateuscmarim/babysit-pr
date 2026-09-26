@@ -1067,6 +1067,18 @@ def _():
     check("head moves mid-wait -> the new head's review answers", code, 0)
     ok("  says so", ">> head moved" in out and f"@ {HEAD[:8]}" in out, out)
 
+    # Everything HeadWatch tracks restarts with the head.
+    code, out, clock = run_main(FakeGitea(head=lambda n: OLD if n <= 8 else HEAD),
+                                "--wait-for", "review")
+    check("a head move restarts the deadline -> TIMED_OUT", code, 2)
+    check("  5m after the move, not 5m after the start", len(clock.sleeps), 17)
+    code, out, clock = run_main(FakeGitea(head=lambda n: OLD if n <= 3 else HEAD,
+                                          jobs=lambda n: RUNNING_JOB if n <= 3 else
+                                          [{"name": "test", "status": "completed",
+                                            "conclusion": "success"}]))
+    ok("  and forgets the old head's open CI: the new head's, passed at first "
+       "sight, is not news", code == 2 and len(clock.sleeps) > 10, (code, len(clock.sleeps)))
+
 
 @section("main: CI")
 def _():
