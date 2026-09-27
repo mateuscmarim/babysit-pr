@@ -9,8 +9,8 @@ PR opened from a fork is found in the upstream.
 | flag | default | |
 |---|---|---|
 | `--repo owner/name --pr N` | inferred | override the inference |
-| `--wait-for` | `any` | `any`: return when the review has news or CI finishes, whichever is first. A review with no findings is not news on its own and waits for CI. `review` / `ci`: wait for that side only. `both`: only once both have settled |
-| `--once` | off | check now and report; don't wait. A stuck Gitea call gives up after ~20s (10s per attempt, 2 attempts) instead of ~100s |
+| `--wait-for` | `any` | `any`: return when the review has news or CI finishes, whichever is first. A review with no findings waits for CI. `review` / `ci`: wait for that side only. `both`: wait for both. Target movement returns promptly. A persistent `mergeable: false` returns after 90 seconds, or at once under `--once`. |
+| `--once` | off | check now and report, including the live target tip and mergeability; don't wait. A stuck Gitea call gives up after ~20s (10s per attempt, 2 attempts) instead of ~100s |
 | `--timeout-minutes` | 35 | the review budget. It restarts when the head moves |
 | `--interval` | 30 | seconds between polls |
 | `--no-fail-fast` | off | keep waiting for the review after CI has failed. Implies `--wait-for review` |

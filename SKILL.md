@@ -22,8 +22,9 @@ python3 ~/.claude/skills/babysit-pr/scripts/poll_review.py > /tmp/babysit-REPO-P
 Use the Bash tool's `run_in_background: true`: the wait runs up to 35
 minutes, and you are notified when it exits. It exits at the first of: the
 review decides (a review, a skip or failure notice, a decline), a new bot
-review lands (even one of an older head), or CI finishes. A review with no
-findings is the exception: it waits for CI, since there is nothing to act on
+review lands (even one of an older head), CI finishes, the target branch moves,
+or Gitea persistently reports the PR is not mergeable. A review with no findings
+is the exception: it waits for CI, since there is nothing to act on
 before CI answers. After starting it, **end your
 turn** and wait for that notification. Don't monitor, poll or `tail -f` the
 file, and don't make placeholder calls (`echo waiting`, `true`, `sleep`) to
@@ -52,10 +53,16 @@ on what came back first, then start that command the same way. The exit code tel
 | 6 | `DECLINED` | no review is coming, for the reason printed |
 | 7 | `PENDING` | CI finished first, `--once`, or a closed PR: no review yet. **Not a pass** |
 | 8 | `CI_FAILED` | CI failed before the review decided |
+| 9 | `BASE_MOVED` | the target branch advanced during this wait; check the new combined tree |
+| 10 | `NOT_MERGEABLE` | Gitea reports `mergeable: false` after a grace period (or under `--once`); it could still be checking, draft, or blocked |
 
-The code is the review's. CI is reported in its own block, and a failed or
-still-running CI next to exit 0 appears as its own step under NEXT. Exit 0
-with CI still running is not a merge signal.
+Except for 9 and 10, the code is the review's. CI and merge readiness have
+their own blocks. Exit 0 is not a merge signal if CI is open or Gitea's
+mergeability is unknown. **Immediately before merging**, refresh the PR and
+target tip, check mergeability again, and ensure the right checks cover the
+current combined tree. If the target moved, update or rebase and rerun the
+appropriate checks. The merge API is the final guard against a last-second
+change.
 
 Three rules the output cannot enforce:
 

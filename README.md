@@ -2,8 +2,9 @@
 
 A Claude Code skill. Waits for `review-bot` (the `gitea-review-agent` companion
 project) to review a PR on your Gitea instance and for that PR's CI to reach a
-final state. It returns as soon as **either** has news, reports what each
-found, and says how to wait for the one still open.
+final state. It returns as soon as **either** has news, or when the target
+branch moves or Gitea persistently reports the PR as unmergeable. It reports what each check found and says what to
+do next.
 
 It exists because the bot cannot block a merge: `build_review_payload`
 hardcodes `"event": "COMMENT"`, never `APPROVE` or `REQUEST_CHANGES`, so branch
@@ -18,15 +19,15 @@ contract in `references/replying.md`, each read only when needed.
 
 ## The flow
 
-The review and CI are two independent verdicts. One loop polls both, and
-neither waits on the other. By default (`--wait-for any`) the loop returns on
-whichever side has news first, so the reader can act on a finding while CI is
+Review, CI, and merge readiness are separate checks. One loop polls all three,
+and neither review nor CI waits on the other. By default (`--wait-for any`),
+the loop returns on whichever side has news first, so the reader can act on a finding while CI is
 still running, or fix a red CI before the review lands. `--wait-for review`,
 `ci` or `both` narrow that; `both` is the old "return only once both settled".
 
 ```mermaid
 flowchart TD
-    A(["poll_review.py"]) --> B["resolve repo + PR, read head SHA"]
+    A(["poll_review.py"]) --> B["resolve repo + PR, read head and live target SHA"]
     B --> C{"PR authored by review-bot?"}
     C -->|yes| CX(["DECLINED · exit 6<br/>parse_event skips these to avoid loops"])
     C -->|no| CL{"PR closed or merged?"}
@@ -45,7 +46,10 @@ flowchart TD
 
     G["classify → review verdict<br/>newest bot review at head wins<br/>REVIEWED · STALE · SKIPPED<br/>FAILED · DECLINED · PENDING"]
     G --> H["read_ci → CI verdict<br/>newest run per workflow + event<br/>PASSED · FAILED · RUNNING<br/>UNKNOWN · NONE"]
-    H --> I{"review decided<br/>AND ci_settled?"}
+    H --> T{"target moved or<br/>mergeable false for 90s?"}
+    T -->|"false persisted / --once"| TX(["NOT_MERGEABLE · exit 10<br/>may be checking, draft, or blocked"])
+    T -->|"target moved"| TY(["BASE_MOVED · exit 9<br/>recheck combined tree"])
+    T -->|no| I{"review decided<br/>AND ci_settled?"}
 
     I -->|yes| IX(["the review's own exit code<br/>REVIEWED 0 · FAILED 3<br/>SKIPPED 4 · DECLINED 6"])
     I -->|no| J{"--once or PR closed?"}
@@ -69,7 +73,7 @@ flowchart TD
     I -.- Z["ci_settled: RUNNING never settles.<br/>PASSED and FAILED settle at once.<br/>UNKNOWN settles only on a 4xx;<br/>a transport error holds the wait.<br/>NONE only after 90s watching this head,<br/>since Gitea may not have created the run yet."]
 ```
 
-Six things this shape depends on:
+Seven things this shape depends on:
 
 - **Control comes back on the first news, not the last.** Waiting for both
   sides held a bot failure posted at 32s until CI finished at 2184s. Each early
@@ -77,9 +81,16 @@ Six things this shape depends on:
   had already passed when the run began, a STALE review that was already
   there, and a review with no findings are not news: returning on them would
   send the reader straight back.
-- **Once the review decides, the code is the review's.** CI gets its own
-  block. `PASSED` CI next to a `FAILED` review is still exit 3, and a failed
-  CI next to a `REVIEWED` is still 0, so read both blocks, not the number.
+- **Once the review decides, the code is the review's, unless merge readiness
+  blocks it.** CI and mergeability get their own blocks. A target movement or
+  unmergeable PR returns with exit 9 or 10, even if review and CI passed. An
+  unknown mergeability result is not an all-clear. Immediately before merging,
+  refresh the PR and target tip; head-SHA CI alone cannot prove the combined
+  tree passes.
+- **CI does not change the review's code.** CI gets its own block. `PASSED` CI
+  next to a `FAILED` review is still exit 3, and failed CI next to a `REVIEWED`
+  review is still 0 when merge readiness does not override it,
+  so read all blocks, not just the number.
 - **`TIMED_OUT` is the last branch, not the default.** The decline paths now
   report as `DECLINED` with a reason, and a Gitea outage reports as
   `UNREACHABLE`. Reaching `TIMED_OUT` means none of them applied.
@@ -93,7 +104,7 @@ Six things this shape depends on:
 - **The output says what to do next.** Every exit path ends with a `>> NEXT:`
   block written for that result: verify these findings, fix CI first, this
   is not a pass. The reader follows the step in front of it instead of
-  keeping a table of nine codes in mind through a 35-minute wait.
+  keeping a table of codes in mind through a 35-minute wait.
 
 ## This repo *is* the installed skill
 

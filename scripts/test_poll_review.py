@@ -970,7 +970,9 @@ class FakeGitea:
     round. `fail(path, n)` may return an exception to raise instead."""
 
     def __init__(self, *, head=None, pr=None, reviews=None, comments=None,
-                 runs=None, jobs=None, inline=None, fail=None, author="someone"):
+                 runs=None, jobs=None, inline=None, fail=None, author="someone",
+                 target=None):
+        self.target = target or (lambda n: OLD)
         self.head = head or (lambda n: HEAD)
         self.pr = pr or (lambda n: {})
         self.reviews = reviews or (lambda n: [])
@@ -992,7 +994,10 @@ class FakeGitea:
         first_page = "page=" not in path or "page=1&" in path
         if base == "/repos/o/r/pulls/7":
             return {"head": {"sha": self.head(self.n)}, "user": {"login": self.author},
-                    "requested_reviewers": [], "state": "open", **self.pr(self.n)}
+                    "requested_reviewers": [], "state": "open", "mergeable": True,
+                    "base": {"ref": "main", "repo": {"full_name": "o/r"}}, **self.pr(self.n)}
+        if base == "/repos/o/r/branches/main" or base == "/repos/upstream/repo/branches/release%2Fstable":
+            return {"commit": {"id": self.target(self.n)}}
         if base == "/repos/o/r/pulls/7/reviews":
             return self.reviews(self.n) if first_page else []
         if m := re.fullmatch(r"/repos/o/r/pulls/7/reviews/(\d+)/comments", base):
@@ -1323,6 +1328,82 @@ def _():
     ok("UNREACHABLE names the endpoint that timed out",
        code == 1 and "timed out on /repos/o/r/actions/runs" in out, out)
     ok("  with no CI note", "CI has not settled" not in out, out)
+
+
+@section("main: target movement and merge readiness")
+def _():
+    code, out, clock = run_main(FakeGitea(reviews=lambda n: [review(HEAD)]))
+    check("unchanged target and mergeable -> review code", code, 0)
+    ok("  target tip and last-minute guard shown", "Merge readiness: YES" in out and "Immediately before merging" in out, out)
+
+    code, out, clock = run_main(FakeGitea(
+        target=lambda n: OLD if n < 4 else HEAD, jobs=lambda n: RUNNING_JOB))
+    check("target moves while waiting -> returns promptly", (code, len(clock.sleeps)), (9, 2))
+    ok("  preserves undecided review and names both tips", "BASE_MOVED" in out and
+       f"{OLD[:8]}" in out and f"{HEAD[:8]}" in out and "PENDING" in out, out)
+
+    code, out, clock = run_main(FakeGitea(
+        pr=lambda n: {"mergeable": False}, jobs=lambda n: RUNNING_JOB), "--once")
+    check("blocked even in --once with review pending", code, 10)
+    ok("  never claims a conflict is known or readiness passed",
+       "NOT MERGEABLE" in out and "Check the reason" in out and "Merge readiness: YES" not in out, out)
+
+    code, out, clock = run_main(FakeGitea(
+        target=lambda n: OLD if n < 3 else HEAD,
+        pr=lambda n: {"mergeable": False} if n >= 3 else {},
+        jobs=lambda n: RUNNING_JOB))
+    check("target movement takes priority over checking mergeability", code, 9)
+    ok("  mentions movement and current mergeability", "Target moved during this wait" in out and "Merge readiness: NO" in out, out)
+
+    code, out, clock = run_main(FakeGitea(
+        pr=lambda n: {"mergeable": False} if n in (2, 3) else {},
+        reviews=lambda n: [review(HEAD)] if n >= 5 else [], jobs=lambda n: RUNNING_JOB),
+        "--wait-for", "review")
+    check("temporary checking state does not end wait", code, 0)
+    ok("  readiness recovers", "Merge readiness: YES" in out, out)
+
+    code, out, clock = run_main(FakeGitea(
+        pr=lambda n: {"mergeable": False}, jobs=lambda n: RUNNING_JOB))
+    check("persistent not mergeable ends wait after grace", code, 10)
+    ok("  does not claim a conflict", "checking, draft, conflict, or other block" in out, out)
+
+    code, out, clock = run_main(FakeGitea(
+        pr=lambda n: {"mergeable": None}, reviews=lambda n: [review(HEAD)]), "--once")
+    check("unknown mergeability does not manufacture a review failure", code, 0)
+    ok("  blocks merge advice", "Merge readiness: UNKNOWN" in out and "do not infer a pass" in out, out)
+
+    code, out, clock = run_main(FakeGitea(
+        pr=lambda n: {"mergeable": None} if n > 2 else {},
+        reviews=lambda n: [review(HEAD)] if n >= 4 else [], jobs=lambda n: RUNNING_JOB),
+        "--wait-for", "review")
+    check("temporarily unknown mergeability does not end the wait", code, 0)
+    ok("  reports unknown when it returns", "Merge readiness: UNKNOWN" in out, out)
+
+    missing = urllib.error.HTTPError("https://test/branch", 404, "not found", {}, None)
+    code, out, clock = run_main(FakeGitea(
+        fail=lambda path, n: missing if path == "/repos/o/r/branches/main" else None,
+        reviews=lambda n: [review(HEAD)]), "--once")
+    check("missing target branch still reports the review", code, 0)
+    ok("  forbids merging without branch tip", "target tip UNKNOWN" in out and "Do not merge" in out, out)
+
+    code, out, clock = run_main(FakeGitea(
+        pr=lambda n: {"state": "closed", "merged": True},
+        fail=lambda path, n: AssertionError("closed PR must not look up branch") if path == "/repos/o/r/branches/main" else None), "--once")
+    check("closed PR does not require a live target", code, 7)
+    ok("  merge readiness not applicable", "Merge readiness: NOT APPLICABLE" in out, out)
+
+    unavailable = TimeoutError("branch fetch timed out")
+    code, out, clock = run_main(FakeGitea(
+        fail=lambda path, n: unavailable if path == "/repos/o/r/branches/main" and n == 3 else None,
+        target=lambda n: OLD if n <= 3 else HEAD, jobs=lambda n: RUNNING_JOB))
+    check("transient branch read is retried, not passed", code, 9)
+    ok("  explicitly reports the outage", "could not read Gitea" in out, out)
+
+    code, out, clock = run_main(FakeGitea(
+        pr=lambda n: {"base": {"ref": "release/stable", "repo": {"full_name": "upstream/repo"}}},
+        reviews=lambda n: [review(HEAD)]), "--once")
+    check("forked target and slash branch can be fetched", code, 0)
+    ok("  prints exact target", "upstream/repo:release/stable" in out, out)
 
 
 if __name__ == "__main__":

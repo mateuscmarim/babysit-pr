@@ -17,10 +17,13 @@ when you have to explain a verdict to someone.
 | `DECLINED` | 6 | The agent says no review is coming for this SHA, and why: diff empty after `SKIP_PATHS`, `nothing_new_since_last_review`, superseded, a bot-authored PR, `lost_on_restart`… | Read the reason. `nothing_new…` means the last review stands. `lost_on_restart` means nobody reviewed this, so re-request. |
 | `PENDING` | 7 | The run returned before the review said anything: CI finished first, `--once`, or a closed PR. Nothing has landed for this head yet. | **Not a pass.** Run the `--wait-for review` command from NEXT, or run without `--once`. A closed PR gets no new review. |
 | `CI_FAILED` | 8 | CI failed before the review decided, so the poller stopped waiting. The review's state is printed: pending, or `STALE` with its findings in full. | Fix CI and push, which restarts the review too. Pass `--no-fail-fast` to wait for the review anyway. |
+| `BASE_MOVED` | 9 | The live target branch tip changed during this run. Review and CI results still describe the head, not necessarily the new combined tree. | Update/rebase if needed, run appropriate checks against the new base, and babysit again. |
+| `NOT_MERGEABLE` | 10 | Gitea reports `mergeable: false` for 90 seconds, or on a `--once` check. This includes temporary checking and drafts as well as conflicts. | Inspect the cause; do not assume a conflict. Rerun when Gitea finishes checking or the block clears. Review and CI remain visible. |
 
 **Once the review has decided, CI never changes the code.** `CI_FAILED` (8)
 fires only while the review is still undecided. A `REVIEWED` next to a failed
-CI exits 0, and the CI block and the NEXT block say the rest.
+CI exits 0, and the CI block and the NEXT block say the rest. Target movement
+and a non-mergeable PR override that exit with codes 9 and 10 respectively.
 
 ## When the wait returns
 
@@ -36,6 +39,11 @@ By default (`--wait-for any`) the poller returns at the first of these:
   and returns once, with both. A failed CI still returns at once.
 - **CI finishes during the run.** A CI that had already passed when the run
   started is not news, and `NONE` never is. A failed CI always is (exit 8).
+- **The target branch moves**, returning promptly regardless of `--wait-for`.
+  Gitea may briefly set `mergeable: false` while recalculating, so movement
+  takes priority over this field.
+- **Gitea continues to report `mergeable: false` for 90 seconds.** A short
+  checking state does not interrupt the wait. `--once` reports false at once.
 
 So a `REVIEWED` with findings next to a running CI exits 0 with a "CI has not
 settled" step, and a CI that passed first exits 7. In both cases the last NEXT step is
@@ -43,6 +51,22 @@ the command that waits for the side still open: `--wait-for ci` returns once
 CI has settled, even if it already has; `--wait-for review` ignores CI unless
 it fails, and returns on a review with no findings too. `--wait-for both` is the old behavior: return only once both have
 settled. `--once` never waits for either.
+
+## Merge readiness
+
+The poller reads the target branch tip separately from the PR's head SHA on
+every round. `Merge readiness: YES` only reports Gitea's mergeability field;
+it is **not** an approval or proof that head-SHA CI tested the merged tree.
+`NO` blocks a merge, but does not diagnose a conflict by itself: it can mean
+checking, draft, conflict, or another block. `UNKNOWN` (null or absent field)
+is not a pass: retry a fresh PR check. If the target branch cannot be read,
+its tip is `UNKNOWN`; the poller can still report review and CI, but not merge
+readiness. Closed PRs do not require a live target tip.
+
+Immediately before merging, refresh the PR and target tip, verify Gitea's
+mergeability, and check that CI covers the current combined tree. If the
+branch moved, update/rebase and rerun the appropriate checks. Only Gitea's
+merge operation can reject a last-second race atomically.
 
 ## CI verdicts
 
