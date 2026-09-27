@@ -1293,8 +1293,12 @@ def read_target(pr: dict, repo: str, tok: str) -> tuple[str, str, str] | None:
         return target_branch(pr, repo, tok)
     except ValueError:
         return None
-    except urllib.error.HTTPError as exc:
-        if exc.code < 500:
+    except urllib.error.HTTPError:
+        # A missing or forbidden branch is unknown, not a reason to lose the
+        # independent review and CI verdicts.
+        return None
+    except Exception as exc:
+        if is_transient(exc):
             return None
         raise
 
@@ -1360,6 +1364,8 @@ def main(argv: list[str] | None = None) -> int:
     pr = api(f"/repos/{repo}/pulls/{pr_num}", tok)
     head = pr["head"]["sha"]
     target = read_target(pr, repo, tok)
+    if target is None and pr.get("state") != "closed":
+        print("  target tip unreadable; merge readiness unknown until rechecked")
     # NB: only the single-PR endpoint populates requested_reviewers. The list
     # endpoint returns [] for every PR, which reads as "nobody was asked".
     requested = BOT in [

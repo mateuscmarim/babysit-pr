@@ -1394,10 +1394,21 @@ def _():
 
     unavailable = TimeoutError("branch fetch timed out")
     code, out, clock = run_main(FakeGitea(
+        fail=lambda path, n: unavailable if path == "/repos/o/r/branches/main" and n == 1 else None,
+        reviews=lambda n: [review(HEAD)]), "--once")
+    check("initial transient branch failure does not lose review or CI", code, 0)
+    ok("  reports initial uncertainty", "target tip unreadable" in out and "Merge readiness: YES" in out, out)
+
+    code, out, clock = run_main(FakeGitea(
+        fail=lambda path, n: unavailable if path == "/repos/o/r/branches/main" else None,
+        reviews=lambda n: [review(HEAD)]), "--once")
+    check("persistent transient branch failure still reports review", code, 0)
+    ok("  explicitly blocks merge readiness", "target tip UNKNOWN" in out and "Do not merge" in out, out)
+
+    code, out, clock = run_main(FakeGitea(
         fail=lambda path, n: unavailable if path == "/repos/o/r/branches/main" and n == 3 else None,
         target=lambda n: OLD if n <= 3 else HEAD, jobs=lambda n: RUNNING_JOB))
-    check("transient branch read is retried, not passed", code, 9)
-    ok("  explicitly reports the outage", "could not read Gitea" in out, out)
+    check("mid-wait transient branch read does not hide later movement", code, 9)
 
     code, out, clock = run_main(FakeGitea(
         pr=lambda n: {"base": {"ref": "release/stable", "repo": {"full_name": "upstream/repo"}}},
