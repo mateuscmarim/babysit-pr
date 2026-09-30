@@ -829,6 +829,24 @@ def _():
     check("EXIT maps every name to its code", poll_review.EXIT, want)
     check("UNREACHABLE is 1", poll_review.EXIT_UNREACHABLE, 1)
 
+    import test_poll_review as gitea_suite
+
+    git_calls: list[list[str]] = []
+
+    def github_checkout(argv, **kw):
+        git_calls.append(argv)
+        out = {"remote": "origin\thttps://github.com/o/r.git (fetch)\n"
+                         "origin\thttps://github.com/o/r.git (push)",
+               "rev-parse": "feat", "config": "origin"}[argv[1]]
+        return type("P", (), {"returncode": 0, "stdout": out})()
+
+    with patched(poll_review.subprocess, run=github_checkout), \
+            patched(github_ci, main=lambda args: sys.exit("entered the GitHub path")):
+        code, out, _ = gitea_suite.run_main(
+            gitea_suite.FakeGitea(reviews=lambda n: [gitea_suite.review(gitea_suite.HEAD, rid=5)]))
+    check("the Gitea suite's main() ignores a github.com/o/r checkout: exits 0", code, 0)
+    ok("  REVIEWED on the Gitea path", "REVIEWED" in out and "NOT_MONITORED" not in out, out)
+
 
 @section("C16: docs name CI_PASSED as not a review")
 def _():
