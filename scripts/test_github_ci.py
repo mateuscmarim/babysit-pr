@@ -8,6 +8,7 @@ recorded rather than raised, and exits 1 if anything failed.
 """
 
 import contextlib
+import http.client
 import io
 import json
 import os
@@ -613,6 +614,49 @@ def _():
     code, out, clock = run_gh(FakeGitHub(fail=lambda path, n: http_error(404, "Not Found")
                                          if path == "/repos/o/r/pulls/7" else None))
     check("a 404 on the PR exits 1 at once", (code, clock.sleeps), (1, []))
+
+    # A body cut short mid-read raises http.client.IncompleteRead, which is
+    # neither an OSError nor a URLError.
+    def cut(*_a):
+        return http.client.IncompleteRead(b"{\"check_ru", 200)
+
+    ok("IncompleteRead is transient", github_ci.is_transient(cut()))
+    with patched(github_ci, api=FakeGitHub(fail=lambda path, n: cut()
+                                           if path.endswith("/check-runs") else None),
+                 github_token=lambda: TOKEN):
+        v = github_ci.read_ci("o/r", HEAD, TOKEN)
+    check("a truncated check-runs body -> UNKNOWN", (v.state, v.permanent), ("UNKNOWN", False))
+
+    code, out, clock = run_gh(FakeGitHub(fail=lambda path, n: cut()
+                                         if path.endswith("/statuses") and n <= 2 else None))
+    check("a truncated statuses body is retried and a later success exits 11", code, 11)
+    check("  after waiting 2 rounds", len(clock.sleeps), 2)
+
+    code, out, clock = run_gh(FakeGitHub(fail=lambda path, n: cut()
+                                         if path == "/repos/o/r/pulls/7" and n <= 2 else None))
+    check("a truncated PR body is retried and a later success exits 11", code, 11)
+    ok("  without a traceback", "Traceback" not in out, out)
+
+    code, out, clock = run_gh(FakeGitHub(fail=lambda path, n: cut()
+                                         if path == "/repos/o/r/pulls/7" else None))
+    check("a PR body truncated to the deadline exits 1", code, 1)
+    ok("  labelled UNREACHABLE", "=== UNREACHABLE" in out, out)
+
+    code, out, clock = run_gh(FakeGitHub(fail=lambda path, n: cut()
+                                         if path == "/repos/o/r/pulls/7" else None), "--once")
+    check("--once with a truncated PR body exits 1 with zero sleeps", (code, clock.sleeps), (1, []))
+
+    code, out, clock = run_gh(FakeGitHub(fail=lambda path, n: cut()
+                                         if path.endswith("/git/ref/heads/main") else None))
+    check("a truncated target-tip body blocks nothing: CI still exits 11", code, 11)
+
+    def resolve_cut(*_a):
+        raise cut()
+
+    with patched(github_ci, resolve=resolve_cut):
+        code, out, clock = run_gh(FakeGitHub())
+    check("a truncated body while finding the PR exits 1", code, 1)
+    ok("  saying no verdict was reached", "no verdict reached" in out, out)
 
 
 @section("C10: waiting, once and closed")

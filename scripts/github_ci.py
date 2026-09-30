@@ -17,6 +17,7 @@ nowhere else -- not to a `link` header URL, not across a redirect.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -167,7 +168,7 @@ def is_transient(exc: BaseException) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code >= 500 or rate_limit_wait(exc) is not None
     return isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError,
-                            json.JSONDecodeError, Unreadable))
+                            http.client.HTTPException, json.JSONDecodeError, Unreadable))
 
 
 def describe(exc: BaseException) -> str:
