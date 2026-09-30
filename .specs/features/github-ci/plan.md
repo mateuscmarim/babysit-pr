@@ -51,9 +51,9 @@ The skill only monitors Gitea. GitHub PR authors cannot use its bounded backgrou
 
 | ID | Slice | Criteria | Status |
 | --- | --- | --- | --- |
-| GHCI-01 | S1 | 1, 2, 3, 4 | Pending |
-| GHCI-02 | S1 | 5, 6, 7, 8 | Pending |
-| GHCI-03 | S1 | 9, 10, 11 | Pending |
+| GHCI-01 | S1 | 1, 2, 3, 4 | Built |
+| GHCI-02 | S1 | 5, 6, 7, 8 | Built |
+| GHCI-03 | S1 | 9, 10, 11 | Built |
 
 ## Observable
 
