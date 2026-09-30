@@ -180,3 +180,85 @@ assertions; line numbers have moved from round 1 and are refreshed here.
 At `5e05d13` from `scripts/`: `python3 test_github_ci.py` - all passed; `python3 test_poll_review.py` -
 all passed; `python3 test_reply_finding.py` - all passed. Scratch worktrees were removed and the real
 tree's `git status --porcelain` matched its baseline.
+
+---
+
+# GitHub CI-only babysitting - verification, round 3
+
+**Verdict**: PASS
+**Profile**: light
+**Diff range**: d2ee17e..0dcd338
+**Round**: 3 - full
+**Verifier**: independent sub-agent (author != verifier)
+
+Rounds 1 and 2 above are preserved as history. This round re-runs every proof at `0dcd338` (the
+fix for Gitea review finding #10042, `_pause` overshooting the wait deadline) and re-verifies all 16
+checks. The only changes since `5e05d13` are `scripts/github_ci.py:640-643` (`_pause`),
+`scripts/test_github_ci.py:641-662` (23 added lines in C10) and the C10 text in `checks.md`. No
+implementation, check or plan file was changed by this round, and no git remote was touched; the
+mutation work ran on a copy under the scratchpad.
+
+## Findings (ranked)
+
+None open. Finding #10042 re-tested and confirmed fixed:
+
+1. **`_pause` no longer outlasts the deadline - fixed, C10.** `github_ci.py:643` is now
+   `max(0.0, min(max(interval, wait or 0.0), deadline - time.monotonic()))`. Called directly with the
+   real clock (`deadline` given as now + remaining): ordinary, 300s left, interval 30 -> 30;
+   10s left -> 10.0; expired -> 0.0; rate-limit wait 120, 300s left -> 120; 10s left -> 10.0; expired -> 0.0;
+   wait 10 below interval 30 -> 30 (the interval still floors a short `retry-after`); interval 400 with
+   60s left -> 60.0; `wait=0` behaves as no wait. Both callers (`github_ci.py:601` transient read,
+   `:627` ordinary poll) pass the result to `time.sleep`; at an expired deadline the pause is 0 and the
+   loop reports (`:590` checks `>= deadline` first; `:605` sets `past`), so a 0 pause does not spin.
+2. **Mutations in a scratch copy (not the real tree)**, each applied to `_pause`'s return line, `-k C10:`:
+   `return interval` -> 7 FAIL; `max(interval, wait or 0)` (no clamp) -> 6 FAIL; dropping the outer
+   `max(0.0, ...)` -> 2 FAIL (expired-deadline pauses return -5.0); ignoring `wait` (`min(interval, left)`)
+   -> 2 FAIL; clamp against a huge constant -> 6 FAIL; the old shape (clamp only the rate-limit branch) -> 2 FAIL.
+   Every mutant is caught, so the new assertions bind each clause of the clamp.
+
+Observation, not a finding: the expired-deadline and 10s-left rate-limit cases are proven only at
+`_pause` level (`test_github_ci.py:656-661`); the end-to-end cases cover the 400s interval, the 70s
+interval and the `retry-after: 1000` path. That matches what C10 claims.
+
+## Checks
+
+All proofs run at HEAD `0dcd338` from `scripts/`, each `-k "C<n>:"` exit 0 with the section's `ok`
+lines present and no `FAIL` line (C1 6, C2 16, C3 8, C4 15, C5 29, C6 18, C7 7, C8 8, C9 18, C10 21,
+C11 8, C12 13, C13 9, C14 21, C15 4, C16 10), so none is a filter matching nothing. Only C10 grew
+(11 -> 21 `ok` lines); C1-C9 and C11-C16 are textually unchanged since round 2, and their round-2
+evidence (assertion lines and claims) still holds; it is carried by reference to the round 2 table, with
+these proofs re-run fresh.
+
+| Check | Claim | Proof run | Evidence | Result |
+| --- | --- | --- | --- | --- |
+| C1 | GET-only, api.github.com-only, no Gitea or review paths | `python3 test_github_ci.py -k C1:` exit 0 | `test_github_ci.py:245` - `all(r.get_method() == "GET" for r in sent)`; `:246` host prefix; `:249` no review endpoint | PASS |
+| C2 | auto selection | `-k C2:` exit 0 | `:281` tracking wins; `:292` ambiguous exits 1; `:325` `reached == ["gitea"]` | PASS |
+| C3 | fork match, foreign ignored, ambiguous, none, detached | `-k C3:` exit 0 | `:373` `got == ("up/app", 12)`; `:386` ambiguous; `:397` detached exit 1 | PASS |
+| C4 | NOT_MONITORED; six options rejected before token/API | `-k C4:` exit 0 | `:404` `"review: NOT_MONITORED" in out`; `:427` `not token_reads and not fake.calls` | PASS |
+| C5 | classification of every status, conclusion and state | `-k C5:` exit 0 | `:458` `check_run_state(run)[0] == want`; `:461` `status_state(...)[0] == want` | PASS |
+| C6 | identity `(app, name, suite)` | `-k C6:` exit 0 | `:475` same-suite rerun PASSED; `:490` `ci.state == "FAILED"` both orders; `:502` no-suite kept | PASS |
+| C7 | exact sha, per_page=100, paging on rel="next" | `-k C7:` exit 0 | `:524` `code == 8`; `:527` `per_page=100`; `:536` one page without link | PASS |
+| C8 | FAILED -> 8; passed -> 11; never 0, no REVIEWED | `-k C8:` exit 0 | `:542` exit 8; `:548` exit 11; `:556` `0 not in codes` | PASS |
+| C9 | unreadable CI never passes; 401; 403/429; deadline; --once | `-k C9:` exit 0 | `:574` UNKNOWN; `:579`/`:580` 401 -> 1, `sleeps == []`; `:594` deadline -> 1; `:600`/`:601` --once | PASS |
+| C10 | waiting, timeout, --once, closed; no sleep passes the deadline (400s interval in 1 min -> `[60.0]`, 70s interval -> last sleep 20s, `retry-after: 1000` -> `[300.0]` exit 1, rate-limit pause with 10s left 10, expired pauses 0) | `-k C10:` exit 0 | `test_github_ci.py:641` exit 2 and `:642` `clock.sleeps == [60.0]`; `:645` exit 2 and `:646` `[70.0, 70.0, 70.0, 70.0, 20.0]`; `:652` exit 1 and `:653` `[300.0]`; `:658` `_pause(30, None, clock.t - 5) == 0.0`; `:659` `_pause(30, 120, clock.t - 5) == 0.0`; `:660` `== 120` inside budget; `:661` `_pause(30, 120, clock.t + 10) == 10`; earlier C10 assertions `:621`-`:639` (round 2) intact | PASS |
+| C11 | head change discards old CI; deadline restarts | `-k C11:` exit 0 | `:647`/`:648` new head -> 11, read at `NEW_HEAD`; `:665`/`:666` -> 2 with `sum(sleeps) > 300` (unaffected by the clamp) | PASS |
+| C12 | BASE_MOVED, 90 s NOT_MERGEABLE, --once, false->true, null, unreadable | `-k C12:` exit 0 | `:674` -> 9; `:678`/`:679` -> 10 after >= 90 s; `:695`/`:696` `target tip UNKNOWN`, `Do not merge` | PASS |
+| C13 | report lines and pinned NEXT | `-k C13:` exit 0 | `:704` `o/r#7 @ ...`; `:711`/`:712` `NOT a review`, `NOT a merge approval`; `:721` pins | PASS |
+| C14 | credential order; Bearer only to https api.github.com; redirects refused | `-k C14:` exit 0 | `:759`-`:761` URL, Bearer, version; `:777` http/:8443 refused; `:806` `got == "HTTPError 301"`; `:820` `TOKEN not in out` | PASS |
+| C15 | Gitea codes unchanged, CI_PASSED 11, suites green, Gitea suite ignores a github checkout | `-k C15:`; `python3 test_poll_review.py`; `python3 test_reply_finding.py` - all exit 0 | `:829` `poll_review.EXIT == want`; `:847` `run_main(...)` code `== 0` with a github `origin`; `git diff d2ee17e..HEAD --stat` on the two suites shows only the round-2 `_git` patch in `test_poll_review.py` | PASS |
+| C16 | docs name CI_PASSED/11 as not a review; refresh rule kept | `-k C16:` exit 0 | `:855` line names `CI_PASSED` and `11`; `:857` `"not a review" in text.lower()`; `:859` `"Immediately before merging"` | PASS |
+
+## Coverage
+
+`light` does not owe a recompute; recorded for the set this round touched.
+
+| Set (size) | Recomputed from | Member -> proof | Unproven |
+| --- | --- | --- | --- |
+| Pause inputs (4): ordinary with time left, ordinary at/over the deadline, rate-limit wait inside the budget, rate-limit wait past it | `github_ci.py:640-643` and its two callers `:601`, `:627` | C10 `:641`-`:646` (ordinary, end to end), `:652`-`:653` (rate-limit past deadline, end to end), `:658`-`:661` (expired both kinds, inside, 10s left) | - |
+
+## Gate
+
+At `0dcd338` from `scripts/`: `python3 test_github_ci.py` - all passed (211 `ok` lines);
+`python3 test_poll_review.py` - all passed (379); `python3 test_reply_finding.py` - all passed (17).
+The real tree's `git status --porcelain` matched its baseline (only `.marim/` untracked before this
+report was appended), and `git remote -v` is unchanged.
