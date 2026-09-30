@@ -98,12 +98,16 @@ def forbidden(what):
     return call
 
 
-def cr(name, status="completed", conclusion="success", *, rid=1, app=15368, url=None):
-    """One check run as GET .../check-runs lists it."""
-    return {"id": rid, "name": name, "status": status, "conclusion": conclusion,
-            "app": {"id": app, "slug": "github-actions", "name": "GitHub Actions"},
-            "html_url": url or f"https://github.com/o/r/runs/{rid}",
-            "details_url": f"https://github.com/o/r/runs/{rid}/details"}
+def cr(name, status="completed", conclusion="success", *, rid=1, app=15368, suite=100, url=None):
+    """One check run as GET .../check-runs lists it. `suite=None` leaves out
+    `check_suite`."""
+    run = {"id": rid, "name": name, "status": status, "conclusion": conclusion,
+           "app": {"id": app, "slug": "github-actions", "name": "GitHub Actions"},
+           "html_url": url or f"https://github.com/o/r/runs/{rid}",
+           "details_url": f"https://github.com/o/r/runs/{rid}/details"}
+    if suite is not None:
+        run["check_suite"] = {"id": suite}
+    return run
 
 
 def st(context, state="success", *, sid=1, url=None):
@@ -476,6 +480,32 @@ def _():
     check("the same name from another app is its own result",
           V([cr("test", "completed", "failure", rid=1, app=1), cr("test", "completed", "success", rid=2, app=2)],
             []).state, "FAILED")
+
+    # Two workflows, one job name each: same app and name, distinct suites.
+    fail_a = cr("build", "completed", "failure", rid=1, suite=100)
+    pass_b = cr("build", "completed", "success", rid=2, suite=200)
+    for label, runs in (("failure listed first", [fail_a, pass_b]), ("success listed first", [pass_b, fail_a])):
+        ci = V(runs, [])
+        check(f"a failed build in another suite is not replaced ({label})", ci.state, "FAILED")
+        check(f"  both runs are listed ({label})",
+              sorted((r.state, r.link) for r in ci.results),
+              [("FAILED", "https://github.com/o/r/runs/1"), ("PASSED", "https://github.com/o/r/runs/2")])
+    code, out, _ = run_gh(FakeGitHub(runs=lambda n, sha: [pass_b, fail_a]))
+    check("  main() exits 8 CI_FAILED", code, 8)
+    ok("  and reports the failed run", "CI_FAILED" in out and "https://github.com/o/r/runs/1" in out, out)
+
+    no_suite_fail = cr("build", "completed", "failure", rid=1, suite=None)
+    for label, newer in (("with a suite", cr("build", "completed", "success", rid=2, suite=200)),
+                         ("without a suite", cr("build", "completed", "success", rid=2, suite=None))):
+        for order in ((no_suite_fail, newer), (newer, no_suite_fail)):
+            check(f"a failure without a suite is not replaced by a newer success {label}",
+                  V(list(order), []).state, "FAILED")
+    check("a success without a suite does not hide an older failure with one",
+          V([cr("build", "completed", "failure", rid=1, suite=100),
+             cr("build", "completed", "success", rid=2, suite=None)], []).state, "FAILED")
+    check("a check_suite without an integer id counts as no suite",
+          V([cr("build", "completed", "failure", rid=1, suite="x"),
+             cr("build", "completed", "success", rid=2, suite="x")], []).state, "FAILED")
     check("a newer status success replaces an older failure",
           V([], [st("ci/jenkins", "success", sid=9), st("ci/jenkins", "failure", sid=3)]).state, "PASSED")
     check("an older status success does not replace a newer failure",

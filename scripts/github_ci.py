@@ -254,12 +254,20 @@ def _newest(items: list, key) -> tuple[list, list]:
 
 
 def _run_identity(run: dict):
-    """(application, name): one app's `test` is not another app's."""
+    """(application, name, check suite): one app's `test` is not another
+    app's, and one workflow's `build` is not another workflow's -- each
+    workflow run is its own check suite. A re-run replaces a run only inside
+    its suite. A run with no suite id is its own identity, so it can add a
+    result but never hide one."""
     app = run.get("app") if isinstance(run.get("app"), dict) else {}
     name = run.get("name")
     if not isinstance(name, str) or not name:
         return None
-    return app.get("id") or app.get("slug"), name
+    suite = run.get("check_suite") if isinstance(run.get("check_suite"), dict) else {}
+    suite_id = suite.get("id")
+    if not isinstance(suite_id, int) or isinstance(suite_id, bool):
+        return object()
+    return app.get("id") or app.get("slug"), name, suite_id
 
 
 def _status_identity(status: dict):
@@ -268,7 +276,7 @@ def _status_identity(status: dict):
 
 
 def classify(runs: list, statuses: list) -> CI:
-    """Worst-of over the newest result per check (app and name) and per status
+    """Worst-of over the newest result per check (app, name and suite) and per status
     context: FAILED > RUNNING > UNKNOWN > PASSED. Nothing at all is NONE."""
     results: list[Result] = []
     newest_runs, bad_runs = _newest(runs, _run_identity)

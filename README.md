@@ -121,7 +121,9 @@ github.com. Outside a checkout the default stays Gitea.
   `both`, `--no-fail-fast`, `--full`) are refused, as are `CI_WORKFLOW_FILE`
   and `CI_JOB_NAME`.
 - **CI is every check run and commit status at the head**, newest per check
-  (application and name) and per status context, read page by page. There is
+  (application, name and check suite) and per status context, read page by
+  page. A re-run replaces a run only within its own suite, so a failing
+  `build` in one workflow is never hidden by a passing `build` in another. There is
   no filter, and branch protection is not evaluated.
 - **A pass is `CI_PASSED`, exit 11.** It is not a review and never exit 0,
   which means a reviewed PR. No checks at all is not a pass: it waits and

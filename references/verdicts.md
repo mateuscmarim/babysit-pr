@@ -97,8 +97,10 @@ apply: the report says `review: NOT_MONITORED` and the code is CI's.
 | `BASE_MOVED` | 9 | The target branch moved during the wait. |
 | `NOT_MERGEABLE` | 10 | GitHub reports `mergeable: false` for 90 seconds, or under `--once`. A CI result waits out that grace, since readiness outranks it. |
 
-CI is the newest check run per application and name, and the newest status
-per context, across every page. A re-run replaces the run it repeats. A push
+CI is the newest check run per application, name and check suite, and the
+newest status per context, across every page. A re-run replaces the run it
+repeats; a same-named job in another workflow (another check suite) counts
+on its own. A push
 restarts the wait and drops the old head's CI. `Merge readiness: UNKNOWN`
 means GitHub is still computing mergeability. The same rule as on Gitea
 holds: immediately before merging, refresh the PR and target tip.
