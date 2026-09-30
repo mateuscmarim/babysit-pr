@@ -85,11 +85,18 @@ def github_token() -> str:
 
 class SameHostRedirect(urllib.request.HTTPRedirectHandler):
     """urllib copies the Authorization header onto a redirect, whatever the
-    host. GitHub redirects a renamed repo within api.github.com; anything
-    else is refused rather than handed the token."""
+    host or scheme. GitHub redirects a renamed repo within
+    https://api.github.com; anything else -- another host, another port, or
+    plain http, which would carry the token in cleartext -- is refused rather
+    than handed the token."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if urllib.parse.urlsplit(newurl).hostname != urllib.parse.urlsplit(API_ROOT).hostname:
+        to, root = urllib.parse.urlsplit(newurl), urllib.parse.urlsplit(API_ROOT)
+        try:
+            port = to.port
+        except ValueError:
+            port = -1
+        if to.scheme != "https" or to.hostname != root.hostname or port not in (None, 443):
             raise urllib.error.HTTPError(
                 req.full_url, code, f"refused redirect off {API_ROOT}", headers, fp
             )

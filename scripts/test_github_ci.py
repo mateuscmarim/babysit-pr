@@ -17,6 +17,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import urllib.response
 from pathlib import Path
 
 import github_ci
@@ -766,7 +767,46 @@ def _():
     except urllib.error.HTTPError as exc:
         got = f"refused {exc.code}"
     ok("a redirect to another host is refused", got.startswith("refused"), got)
-    same = handler.redirect_request(req, None, 301, "Moved", {}, "https://api.github.com/repositories/1/pulls/7")
+    for url in ("http://api.github.com/repositories/1/pulls/7",
+                "https://api.github.com:8443/repositories/1/pulls/7"):
+        try:
+            handler.redirect_request(req, None, 301, "Moved", {}, url)
+            got = "followed"
+        except urllib.error.HTTPError as exc:
+            got = f"refused {exc.code}"
+        ok(f"a redirect to {url.split('/repositories')[0]} is refused", got.startswith("refused"), got)
+
+    # End to end through the real opener: a 301 to http:// must not reach the
+    # http handler, so the token never goes out in cleartext.
+    followed: list[urllib.request.Request] = []
+
+    class Redirecting(urllib.request.BaseHandler):
+        handler_order = 100  # ahead of urllib's own handlers: no network
+
+        def https_open(self, r):
+            resp = urllib.response.addinfourl(
+                io.BytesIO(b""), {"location": "http://api.github.com/repositories/1/pulls/7"},  # type: ignore[arg-type]
+                r.full_url, 301)
+            resp.msg = "Moved Permanently"  # type: ignore[attr-defined]
+            return resp
+
+        def http_open(self, r):
+            followed.append(r)
+            raise AssertionError("followed a redirect to http://")
+
+    opener = urllib.request.build_opener(github_ci.SameHostRedirect, Redirecting)
+    with patched(github_ci, _OPENER=opener):
+        try:
+            github_ci.api("/repos/o/r/pulls/7", TOKEN)
+            got = "no error"
+        except urllib.error.HTTPError as exc:
+            got = f"HTTPError {exc.code}"
+        except AssertionError as exc:
+            got = f"followed: {exc}"
+    ok("  api() raises on a redirect to http://", got == "HTTPError 301", got)
+    check("  and sends nothing over http://", followed, [])
+
+    same =handler.redirect_request(req, None, 301, "Moved", {}, "https://api.github.com/repositories/1/pulls/7")
     ok("a redirect within api.github.com is allowed",
        same is not None and same.full_url.startswith("https://api.github.com/"), same)
 
