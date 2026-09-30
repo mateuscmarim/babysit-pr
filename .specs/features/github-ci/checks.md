@@ -123,3 +123,13 @@ Intended split, with the arithmetic, written before any code:
 
 - S1 touches `poll_review.py`, a new GitHub module, two test files and five docs: 189 KB / 4
   = ~47k, under the 150k default budget -> one builder, no handoff
+
+- **Boundary:** C1-C15 closed at `9bcb815`; C16 closes with the docs commit that follows it
+- **Settled mid-build:** C11's second fixture let the old head's `FAILED` end the wait before
+  the head could move, which is correct behavior but not "mid-wait". The fixture now holds that
+  failure with `mergeable: false` inside the 90-second grace and then moves the head; the claim
+  and its assertions are unchanged. A CI answer held by `mergeable: false` inside the grace is the
+  implementation's reading of "readiness overrides CI" (AC 9).
+- **Abandoned:** checking `total_count` against the collected check runs - its meaning under
+  `filter=latest` is not documented, and a mismatch would have made every read UNKNOWN; the
+  `link` header alone decides paging

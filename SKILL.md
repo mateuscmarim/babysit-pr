@@ -1,6 +1,6 @@
 ---
 name: babysit-pr
-description: Use before merging a pull request on a Gitea instance. It waits for review-bot's automated review and the PR's CI, returns as soon as either one has news, and reports what each found. Triggers on "babysit this PR", "wait for the review", "is the bot done", "is CI green on this Gitea PR", or any merge of a Gitea PR opened while the reviewer is live.
+description: Use before merging a pull request on a Gitea instance or github.com. On Gitea it waits for review-bot's automated review and the PR's CI, returns as soon as either one has news, and reports what each found. On github.com it waits for CI only, since the bot is not there yet. Triggers on "babysit this PR", "wait for the review", "is the bot done", "is CI green on this Gitea PR", "wait for CI on this GitHub PR", or any merge of a Gitea PR opened while the reviewer is live.
 ---
 
 # Babysit a PR until the reviewer has spoken
@@ -35,6 +35,15 @@ Repo and PR are inferred from the checkout. Pass `--repo owner/name --pr N`
 from anywhere else. Other flags, the environment variables and live-output
 tips are in [references/setup.md](references/setup.md).
 
+## GitHub: CI only
+
+On a github.com PR the poller watches CI and merge readiness, not a review:
+review-bot is not on GitHub yet. The provider comes from the checkout's
+remotes; outside a checkout it is Gitea, so pass `--provider github`. The
+header says `review: NOT_MONITORED`. A CI pass exits 11 `CI_PASSED`, which is
+**not a review** and not a merge approval. `--wait-for review` or `both`,
+`--no-fail-fast`, `--full` and the Gitea CI filters are refused there.
+
 ## Read the result
 
 The output ends with a **`>> NEXT:`** block that says what to do for this
@@ -55,8 +64,10 @@ on what came back first, then start that command the same way. The exit code tel
 | 8 | `CI_FAILED` | CI failed before the review decided |
 | 9 | `BASE_MOVED` | the target branch advanced during this wait; check the new combined tree |
 | 10 | `NOT_MERGEABLE` | Gitea reports `mergeable: false` after a grace period (or under `--once`); it could still be checking, draft, or blocked |
+| 11 | `CI_PASSED` | GitHub only: every check at the head succeeded. **Not a review**, and no reviewer was watched |
 
-Except for 9 and 10, the code is the review's. CI and merge readiness have
+On Gitea, except for 9 and 10, the code is the review's. On GitHub it is
+CI's: 11, 8, 7 or 2, or 9 and 10 for readiness. CI and merge readiness have
 their own blocks. Exit 0 is not a merge signal if CI is open or Gitea's
 mergeability is unknown. **Immediately before merging**, refresh the PR and
 target tip, check mergeability again, and ensure the right checks cover the
@@ -85,5 +96,5 @@ Run the tests after any change, and read [HISTORY.md](HISTORY.md) before
 loosening a rule. It holds the incidents behind each one.
 
 ```bash
-cd ~/.claude/skills/babysit-pr/scripts && python3 test_poll_review.py && python3 test_reply_finding.py
+cd ~/.claude/skills/babysit-pr/scripts && python3 test_poll_review.py && python3 test_github_ci.py && python3 test_reply_finding.py
 ```
