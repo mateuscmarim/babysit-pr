@@ -640,6 +640,4 @@ def watch(repo: str, pr_num: int, tok: str, *, once: bool, timeout_s: float, int
 def _pause(interval: float, wait: float | None, deadline: float) -> float:
     """The interval, or longer when GitHub asked for it -- but not past the
     deadline, where the run reports instead."""
-    if not wait or wait <= interval:
-        return interval
-    return max(interval, min(wait, deadline - time.monotonic()))
+    return max(0.0, min(max(interval, wait or 0.0), deadline - time.monotonic()))

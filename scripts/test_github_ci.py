@@ -638,6 +638,29 @@ def _():
                                          pr=lambda n: {"state": "closed", "mergeable": None}))
     check("a closed PR with RUNNING exits 7 without sleeping", (code, clock.sleeps), (7, []))
 
+    # No sleep outlasts the budget, whatever the interval or GitHub asks for.
+    code, out, clock = run_gh(FakeGitHub(runs=lambda n, sha: RUNNING),
+                              "--timeout-minutes", "1", "--interval", "400")
+    check("a 1-minute budget with a 400s interval times out", code, 2)
+    check("  after one sleep of the 60s left", clock.sleeps, [60.0])
+
+    code, out, clock = run_gh(FakeGitHub(runs=lambda n, sha: RUNNING), "--interval", "70")
+    check("a 70s interval in a 5-minute budget times out", code, 2)
+    check("  the final sleep is the 20s left", clock.sleeps, [70.0, 70.0, 70.0, 70.0, 20.0])
+
+    code, out, clock = run_gh(FakeGitHub(fail=lambda path, n: http_error(429, "Too Many Requests",
+                                                                         {"retry-after": "1000"})
+                                         if path.endswith("/check-runs") else None))
+    check("a retry-after past the deadline exits 1", code, 1)
+    check("  after one sleep of the 300s left", clock.sleeps, [300.0])
+
+    clock = FakeClock()
+    with patched(github_ci, time=clock):
+        check("an ordinary pause at an expired deadline is 0", github_ci._pause(30, None, clock.t - 5), 0.0)
+        check("a rate-limit pause at an expired deadline is 0", github_ci._pause(30, 120, clock.t - 5), 0.0)
+        check("a rate-limit pause inside the budget is what GitHub asked", github_ci._pause(30, 120, clock.t + 300), 120)
+        check("a rate-limit pause with 10s left is 10, not the interval", github_ci._pause(30, 120, clock.t + 10), 10)
+
 
 @section("C11: head movement discards old CI")
 def _():
