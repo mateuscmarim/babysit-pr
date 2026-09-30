@@ -19,8 +19,10 @@ March 10, 2028):
 - `GET /repos/{owner}/{repo}/commits/{sha}/check-runs`: `{total_count, check_runs}`, `per_page`
   max 100, `filter` default `latest`; `status` queued|in_progress|completed|waiting|requested|pending,
   `conclusion` success|failure|neutral|cancelled|skipped|timed_out|action_required (plus `stale`
-  and `startup_failure` from the check-suite vocabulary) or null; `name`, `app`, `html_url`,
-  `details_url`.
+  and `startup_failure` from the check-suite vocabulary) or null; `name`, `app`, `check_suite.id`,
+  `html_url`, `details_url`. Each GitHub Actions workflow run is its own check suite, so two
+  workflows with a job of the same name report two runs with one `app` and `name` but distinct
+  `check_suite.id`; `filter=latest` keeps both.
 - `GET /repos/{owner}/{repo}/commits/{sha}/statuses`: array, reverse chronological, `per_page`
   max 100; `state` error|failure|pending|success, `context`, `target_url`.
 - `GET /repos/{owner}/{repo}/git/ref/heads/{branch}`: `object.sha`; 404 when absent.
@@ -49,7 +51,7 @@ Proof: `python3 test_github_ci.py -k C4:`
 **C5** - Classification: check-run status `queued`, `in_progress`, `waiting`, `requested`, `pending` -> RUNNING; `completed` with `success`, `neutral`, `skipped` -> success; with `failure`, `cancelled`, `timed_out`, `action_required`, `stale`, `startup_failure` -> FAILED; an unrecognized status or conclusion, a null conclusion on `completed`, or a non-object entry -> UNKNOWN; commit status `pending` -> RUNNING, `success` -> success, `failure`, `error` -> FAILED, anything else -> UNKNOWN (GHCI-02, AC 5)
 Proof: `python3 test_github_ci.py -k C5:`
 
-**C6** - Newest result per identity: a check run with a higher id and the same app and name replaces an older `failure` (verdict PASSED); the same name from a different app is kept as its own result; for statuses the newest per context wins in both directions (a newer `success` replaces an older `failure`, an older `success` does not replace a newer `failure`) (GHCI-02, AC 5)
+**C6** - Newest result per identity `(app, name, check_suite.id)`: a check run with a higher id and the same app, name and suite replaces an older `failure` (verdict PASSED); the same name from a different app is kept as its own result; a `failure` named `build` in suite 100 and a higher-id `success` named `build` from the same app in suite 200 read FAILED in either listing order, list both runs, and `main()` exits 8 `CI_FAILED`; a run with no `check_suite.id` is never merged with another run, so a `failure` without a suite next to a higher-id `success` with the same app and name (with or without a suite) reads FAILED; for statuses the newest per context wins in both directions (a newer `success` replaces an older `failure`, an older `success` does not replace a newer `failure`) (GHCI-02, AC 5)
 Proof: `python3 test_github_ci.py -k C6:`
 
 **C7** - Check runs and statuses are read at `/commits/<exact head sha>/...` with `per_page=100&page=N`; page N+1 is requested only when the response's `link` header has `rel="next"`, and a `failure` that exists only on page 2 makes the run exit 8 (GHCI-02, AC 5)
@@ -73,10 +75,10 @@ Proof: `python3 test_github_ci.py -k C12:`
 **C13** - The report prints `o/r#7 @ <head[:8]>`, each check's name with its `html_url` or `target_url`, the CI state and a `Merge readiness:` line; the `>> NEXT:` block contains `--provider github --repo o/r --pr 7` for `--once` with RUNNING, `TIMED_OUT` and `BASE_MOVED`, and for `CI_PASSED` says it is not a review and not a merge approval (GHCI-03, AC 10)
 Proof: `python3 test_github_ci.py -k C13:`
 
-**C14** - Credentials: `GH_TOKEN` is used over `GITHUB_TOKEN`, which is used over `gh auth token --hostname github.com`; none of the three exits 1; the token is sent only as `Authorization: Bearer` to `https://api.github.com`, never printed (including on error paths), never sent on a redirect to another host, and pagination never requests a URL taken from a `link` header (GHCI-03, AC 10)
+**C14** - Credentials: `GH_TOKEN` is used over `GITHUB_TOKEN`, which is used over `gh auth token --hostname github.com`; none of the three exits 1; the token is sent only as `Authorization: Bearer` to `https://api.github.com`, never printed (including on error paths), never sent on a redirect to another host, to `http://api.github.com` or to another port of `api.github.com` (each refused before a request is built, while `https://api.github.com/...` is followed), and pagination never requests a URL taken from a `link` header (GHCI-03, AC 10)
 Proof: `python3 test_github_ci.py -k C14:`
 
-**C15** - Gitea behavior is unchanged: exit codes 0-10 keep their names and values, `CI_PASSED` is 11, and the existing suites pass without edits to their assertions (GHCI-03, AC 11)
+**C15** - Gitea behavior is unchanged: exit codes 0-10 keep their names and values, `CI_PASSED` is 11, and the existing suites pass without edits to their assertions; `test_poll_review.run_main` takes the Gitea path and exits 0 `REVIEWED` for a reviewed head even when `git remote -v` reports `origin https://github.com/o/r.git`, without entering the GitHub path (GHCI-03, AC 11)
 Proof: `python3 test_github_ci.py -k C15:`
 Proof: `python3 test_poll_review.py`
 Proof: `python3 test_reply_finding.py`
@@ -130,6 +132,12 @@ Intended split, with the arithmetic, written before any code:
   failure with `mergeable: false` inside the 90-second grace and then moves the head; the claim
   and its assertions are unchanged. A CI answer held by `mergeable: false` inside the grace is the
   implementation's reading of "readiness overrides CI" (AC 9).
+- **Amended after verification round 1 (user-approved, 2026-09-30):** C6 keys check runs by
+  `check_suite.id` too, because `(app, name)` let a passing job hide a failing same-named job
+  from another workflow (F1); a run without a suite id is kept on its own, which can only report
+  an extra result, never hide one. C14 also refuses non-HTTPS and off-port redirects (F3). C15
+  also proves the Gitea suite ignores the checkout's remotes (F2); only its harness changed,
+  not its assertions. The round-1 `verification.md` stays as history.
 - **Abandoned:** checking `total_count` against the collected check runs - its meaning under
   `filter=latest` is not documented, and a mismatch would have made every read UNKNOWN; the
   `link` header alone decides paging
