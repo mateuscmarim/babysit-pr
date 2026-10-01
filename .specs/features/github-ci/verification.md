@@ -262,3 +262,86 @@ At `0dcd338` from `scripts/`: `python3 test_github_ci.py` - all passed (211 `ok`
 `python3 test_poll_review.py` - all passed (379); `python3 test_reply_finding.py` - all passed (17).
 The real tree's `git status --porcelain` matched its baseline (only `.marim/` untracked before this
 report was appended), and `git remote -v` is unchanged.
+
+---
+
+# GitHub CI-only babysitting - verification, round 4
+
+**Verdict**: PASS
+**Profile**: light
+**Diff range**: d2ee17e..445b010
+**Round**: 4 - full
+**Verifier**: independent sub-agent (author != verifier)
+
+Rounds 1-3 above are preserved as history. This round re-runs every proof at `445b010` (the fix for
+Gitea review finding #10052, a truncated body escaping as `http.client.IncompleteRead`) and
+re-verifies all 16 checks. The only changes since `cfcf24c` are `scripts/github_ci.py` (`import
+http.client`; `http.client.HTTPException` added to `is_transient`, line 171), 44 added lines in
+`scripts/test_github_ci.py` (C9, `:618-659`) and the C9 text in `checks.md`. No implementation,
+check, plan or remote was changed by this round; the mutation ran on a copy under the scratchpad.
+
+## Findings (ranked)
+
+None open. Finding #10052 re-tested and confirmed fixed:
+
+1. **A truncated body is transient on every path - fixed, C9.** `is_transient` (`github_ci.py:164-171`)
+   now includes `http.client.HTTPException`, which `IncompleteRead` subclasses. Every path routes
+   through it:
+   - CI read: `read_ci` (`:319-323`) returns `UNKNOWN, permanent=False` -> `:628` asserts `("UNKNOWN", False)`.
+   - Startup/PR poll and statuses: `watch` (`:584-591`) retries while transient; asserted at `:632`/`:636` (later success exits 11) and `:640-641` (to the deadline exits 1, `=== UNREACHABLE`), `:645` (`--once` exits 1, zero sleeps).
+   - Target tip: `:416-421` returns `None` for a transient error, so nothing blocks -> `:649` exits 11.
+   - PR discovery: `main` (`:537-540`) catches `Exception` -> `could not find the PR ... no verdict reached`, exit 1 -> `:656`/`:657`, no traceback.
+2. **Mutation in a scratch copy:** removing `http.client.HTTPException` from the `is_transient` tuple
+   makes `-k C9:` fail (`is_transient` assertion FAIL, then the section crashes with a
+   `Traceback` from the escaping exception), so the new assertions bind the fix.
+
+Observation, not a finding: the "no traceback" assertion on the discovery path is checked via
+exit code and the `no verdict reached` text, and the retry cases check `"Traceback" not in out`
+(`:638`); the discovery case does not assert absence of a traceback textually, but an uncaught
+exception would have exited non-1 through the harness.
+
+## Checks
+
+All proofs run at HEAD `445b010` from `scripts/`, each `-k "C<n>:"` exit 0 with the section's `ok`
+lines present (C1 6, C2 16, C3 8, C4 15, C5 29, C6 18, C7 7, C8 8, C9 30, C10 21, C11 8, C12 13,
+C13 9, C14 21, C15 4, C16 10), so none is a filter matching nothing. A `FAIL` grep matches only
+check titles containing the word `FAILED`; no `FAIL` result line appears. Only C9 grew (18 -> 30);
+the other fifteen are textually unchanged since round 3 and their round-3 evidence still holds,
+carried by reference with these proofs re-run fresh.
+
+| Check | Claim | Proof run | Evidence | Result |
+| --- | --- | --- | --- | --- |
+| C1 | GET-only, api.github.com-only, no Gitea or review paths | `python3 test_github_ci.py -k C1:` exit 0 | `test_github_ci.py:245` - `all(r.get_method() == "GET" for r in sent)`; `:246` host prefix; `:249` no review endpoint | PASS |
+| C2 | auto selection | `-k C2:` exit 0 | `:281` tracking wins; `:292` ambiguous exits 1; `:325` `reached == ["gitea"]` | PASS |
+| C3 | fork match, foreign ignored, ambiguous, none, detached | `-k C3:` exit 0 | `:373` `got == ("up/app", 12)`; `:386` ambiguous; `:397` detached exit 1 | PASS |
+| C4 | NOT_MONITORED; six options rejected before token/API | `-k C4:` exit 0 | `:404` `"review: NOT_MONITORED" in out`; `:427` `not token_reads and not fake.calls` | PASS |
+| C5 | classification of every status, conclusion and state | `-k C5:` exit 0 | `:458` `check_run_state(run)[0] == want`; `:461` `status_state(...)[0] == want` | PASS |
+| C6 | identity `(app, name, suite)` | `-k C6:` exit 0 | `:475` same-suite rerun PASSED; `:490` `ci.state == "FAILED"` both orders; `:502` no-suite kept | PASS |
+| C7 | exact sha, per_page=100, paging on rel="next" | `-k C7:` exit 0 | `:524` `code == 8`; `:527` `per_page=100`; `:536` one page without link | PASS |
+| C8 | FAILED -> 8; passed -> 11; never 0, no REVIEWED | `-k C8:` exit 0 | `:542` exit 8; `:548` exit 11; `:556` `0 not in codes` | PASS |
+| C9 | unreadable CI never passes; 401; 403/429; deadline; --once; truncated body transient on CI, statuses, PR, deadline, --once, target tip, discovery | `-k C9:` exit 0 | `:574` UNKNOWN; `:579`/`:580` 401 -> 1, `sleeps == []`; `:623` `is_transient(cut())`; `:628` `(v.state, v.permanent) == ("UNKNOWN", False)`; `:632` statuses retried -> 11, `:633` 2 sleeps; `:636` PR retried -> 11; `:641` `"=== UNREACHABLE"`; `:645` `--once` `(1, [])`; `:649` target tip -> 11; `:656`/`:657` discovery exit 1, `no verdict reached` | PASS |
+| C10 | waiting, timeout, --once, closed; no sleep passes the deadline | `-k C10:` exit 0 | `:641`/`:642` `clock.sleeps == [60.0]`; `:645`/`:646` `[70.0, 70.0, 70.0, 70.0, 20.0]`; `:652`/`:653` `[300.0]`; `:658`-`:661` `_pause` cases | PASS |
+| C11 | head change discards old CI; deadline restarts | `-k C11:` exit 0 | `:647`/`:648` new head -> 11; `:665`/`:666` -> 2 with `sum(sleeps) > 300` | PASS |
+| C12 | BASE_MOVED, 90 s NOT_MERGEABLE, --once, false->true, null, unreadable | `-k C12:` exit 0 | `:674` -> 9; `:678`/`:679` -> 10; `:695`/`:696` `target tip UNKNOWN`, `Do not merge` | PASS |
+| C13 | report lines and pinned NEXT | `-k C13:` exit 0 | `:704` `o/r#7 @ ...`; `:711`/`:712` `NOT a review`, `NOT a merge approval`; `:721` pins | PASS |
+| C14 | credential order; Bearer only to https api.github.com; redirects refused | `-k C14:` exit 0 | `:759`-`:761` URL, Bearer, version; `:777` http/:8443 refused; `:806` `got == "HTTPError 301"`; `:820` `TOKEN not in out` | PASS |
+| C15 | Gitea codes unchanged, CI_PASSED 11, suites green | `-k C15:`; `python3 test_poll_review.py`; `python3 test_reply_finding.py` - all exit 0 | `:829` `poll_review.EXIT == want`; `:847` `run_main(...)` code `== 0` with a github `origin`; the two Gitea suites are untouched by `445b010` | PASS |
+| C16 | docs name CI_PASSED/11 as not a review; refresh rule kept | `-k C16:` exit 0 | `:855` names `CI_PASSED` and `11`; `:857` `"not a review" in text.lower()`; `:859` `"Immediately before merging"` | PASS |
+
+Line numbers for C10-C16 are the round-3 citations; the 44 lines added at `:618-659` shift later
+sections, so confirm them by the quoted expression rather than the number.
+
+## Coverage
+
+`light` does not owe a recompute; recorded for the set this round touched.
+
+| Set (size) | Recomputed from | Member -> proof | Unproven |
+| --- | --- | --- | --- |
+| Truncated-body read sites (5): CI check-runs/statuses, PR fetch, target tip, PR discovery, `--once` | `github_ci.py:319`, `:416`, `:537`, `:584-591` | C9 `:628`, `:632`/`:636`, `:640`-`:645`, `:649`, `:656`/`:657` | - |
+
+## Gate
+
+At `445b010` from `scripts/`: `python3 test_github_ci.py` - all passed (223 `ok` lines);
+`python3 test_poll_review.py` - all passed (380); `python3 test_reply_finding.py` - all passed (17).
+The real tree's `git status --porcelain` shows only `.marim/` untracked (before this report was
+appended), and `git remote -v` is unchanged (`origin`, `github`). Nothing was pushed.
