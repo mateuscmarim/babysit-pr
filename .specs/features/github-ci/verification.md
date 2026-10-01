@@ -345,3 +345,83 @@ At `445b010` from `scripts/`: `python3 test_github_ci.py` - all passed (223 `ok`
 `python3 test_poll_review.py` - all passed (380); `python3 test_reply_finding.py` - all passed (17).
 The real tree's `git status --porcelain` shows only `.marim/` untracked (before this report was
 appended), and `git remote -v` is unchanged (`origin`, `github`). Nothing was pushed.
+
+---
+
+# GitHub CI-only babysitting - verification, round 5
+
+**Verdict**: PASS
+**Profile**: light
+**Diff range**: d2ee17e..54a1853
+**Round**: 5 - full
+**Verifier**: independent sub-agent (author != verifier)
+
+Rounds 1-4 above are preserved as history. This round re-runs every proof at `54a1853` (the fix for
+Gitea review finding #10058: an explicit `--repo` was also admitted as a head source) and re-verifies
+all 16 checks. Since `aa3d770` only `scripts/github_ci.py` (one call, `:526-528`) and 48 added lines in
+`scripts/test_github_ci.py` (C3, `:401-448`) changed. No implementation, check, plan or remote was
+changed by this round; the mutation and the independent scenarios ran on a copy under the scratchpad.
+
+## Findings (ranked)
+
+None open. Finding #10058 re-tested and confirmed fixed:
+
+1. **Explicit `--repo` cannot enter the head allowlist - fixed, C3.** `resolve` (`github_ci.py:509-528`)
+   now ends `return infer_pr(repos, ours, branch, tok)`; `ours` is built only from `remote_repos(git remote -v)`
+   (`:515-517`), `repos` is `[args.repo]` (`:519`) and feeds only the search list in `infer_pr` (`:384`).
+   `infer_pr` accepts a PR only when `head.repo.full_name in ours` (`:391`) and derives owners from `ours` (`:382`).
+2. **Independent scenarios** (own fake API over `github_ci.resolve`, sole checkout remote `fork -> me/r`,
+   branch `feat`, upstream `o/r`):
+   - explicit `--repo o/r`, only upstream's own `feat` PR 5 open -> `exit`, `no open PR found ... pass --repo owner/name --pr N`;
+     the only request was `head=me%3Afeat` (never `o%3Afeat`).
+   - explicit `--repo o/r`, PR 5 (head `o/r`) and PR 7 (head `me/r`) -> `('o/r', 7)`, no ambiguity.
+   - explicit `--repo o/r --pr 9`, no checkout (`git remote -v` -> None) -> `('o/r', 9)`, zero API calls.
+   - explicit `--repo o/r`, no `--pr`, no checkout -> exit 1 asking for `--pr`; zero API calls.
+3. **Mutation in a scratch copy:** restoring the old call `infer_pr(repos, list(dict.fromkeys([*repos, *ours])), ...)`
+   makes `-k C3:` fail 4 assertions (both PR-5-only cases, the unambiguous fork case with
+   `several open PRs (o/r#5, o/r#7)`, and the "watches PR 7, never PR 5" case), so the new tests bind the fix.
+
+## Checks
+
+All proofs run at HEAD `54a1853` from `scripts/`, each `-k "C<n>:"` exit 0 with the section's `ok`
+lines present and no `FAIL` line (C1 6, C2 16, C3 12, C4 15, C5 29, C6 18, C7 7, C8 8, C9 30, C10 21,
+C11 8, C12 13, C13 9, C14 21, C15 4, C16 10), so none is a filter matching nothing. Only C3 grew (8 -> 12); the
+other fifteen are textually unchanged since round 4 and their round-4 evidence still holds, carried by
+reference with these proofs re-run fresh.
+
+| Check | Claim | Proof run | Evidence | Result |
+| --- | --- | --- | --- | --- |
+| C1 | GET-only, api.github.com-only, no Gitea or review paths | `python3 test_github_ci.py -k C1:` exit 0 | `test_github_ci.py:246` - `all(r.get_method() == "GET" for r in sent)` | PASS |
+| C2 | auto selection | `-k C2:` exit 0 | `:281` tracking wins; `:292` ambiguous exits 1; `:325` `reached == ["gitea"]` | PASS |
+| C3 | fork match, foreign ignored, ambiguous, none, detached, explicit --repo not a head source | `-k C3:` exit 0 | `:373` `got == ("up/app", 12)`; `:386` ambiguous; `:397` detached exit 1; `:438-440` `got.startswith("exit 1") and "--pr" in got and "/repos/o/r/pulls/5" not in calls`; `:442-443` every `/pulls?` call has `head=me%3Afeat`; `:445` `check(..., got, 11)`; `:446-447` PR 7 watched, never PR 5 | PASS |
+| C4 | NOT_MONITORED; six options rejected before token/API | `-k C4:` exit 0 | `"review: NOT_MONITORED" in out`; `not token_reads and not fake.calls` | PASS |
+| C5 | classification of every status, conclusion and state | `-k C5:` exit 0 | `check_run_state(run)[0] == want`; `status_state(...)[0] == want` | PASS |
+| C6 | identity `(app, name, suite)` | `-k C6:` exit 0 | `ci.state == "FAILED"` in both orders; no-suite run kept | PASS |
+| C7 | exact sha, per_page=100, paging on rel="next" | `-k C7:` exit 0 | `code == 8` for a page-2 failure; `per_page=100`; one page without link | PASS |
+| C8 | FAILED -> 8; passed -> 11; never 0, no REVIEWED | `-k C8:` exit 0 | exit 8; exit 11; `0 not in codes` | PASS |
+| C9 | unreadable CI never passes; 401; 403/429; deadline; --once; truncated body | `-k C9:` exit 0 | `(v.state, v.permanent) == ("UNKNOWN", False)`; 401 -> 1 with `sleeps == []`; `"=== UNREACHABLE"` | PASS |
+| C10 | waiting, timeout, --once, closed; no sleep passes the deadline | `-k C10:` exit 0 | `clock.sleeps == [60.0]`; `[70.0, 70.0, 70.0, 70.0, 20.0]`; `[300.0]` | PASS |
+| C11 | head change discards old CI; deadline restarts | `-k C11:` exit 0 | new head -> 11; `sum(sleeps) > 300` -> 2 | PASS |
+| C12 | BASE_MOVED, 90 s NOT_MERGEABLE, --once, false->true, null, unreadable | `-k C12:` exit 0 | -> 9; -> 10; `target tip UNKNOWN`, `Do not merge` | PASS |
+| C13 | report lines and pinned NEXT | `-k C13:` exit 0 | `o/r#7 @ ...`; `NOT a review`, `NOT a merge approval` | PASS |
+| C14 | credential order; Bearer only to https api.github.com; redirects refused | `-k C14:` exit 0 | Bearer and version headers; http/:8443 refused; `TOKEN not in out` | PASS |
+| C15 | Gitea codes unchanged, CI_PASSED 11, suites green | `-k C15:`; `python3 test_poll_review.py`; `python3 test_reply_finding.py` - all exit 0 | `poll_review.EXIT == want`; `run_main(...)` code `== 0` with a github `origin`; both Gitea suites untouched by `54a1853` | PASS |
+| C16 | docs name CI_PASSED/11 as not a review; refresh rule kept | `-k C16:` exit 0 | `"not a review" in text.lower()`; `"Immediately before merging"` | PASS |
+
+Line numbers outside C3 are round-4 citations; the C3 additions at `:401-448` shift later sections,
+so confirm them by the quoted expression rather than the number.
+
+## Coverage
+
+`light` does not owe a recompute; recorded for the set this round touched.
+
+| Set (size) | Recomputed from | Member -> proof | Unproven |
+| --- | --- | --- | --- |
+| inference outcomes (4) plus explicit-repo handling | `github_ci.py:373-401`, `:509-528` | fork match C3 `:373` · foreign ignored C3 · ambiguous C3 `:386` · none C3 · explicit `--repo` not a head source C3 `:438`/`:445` | - |
+
+## Gate
+
+At `54a1853` from `scripts/`: `python3 test_github_ci.py` - all passed (227 `ok` lines);
+`python3 test_poll_review.py` - all passed; `python3 test_reply_finding.py` - all passed.
+The real tree's `git status --porcelain` shows only `.marim/` untracked (before this report was
+appended), and `git remote -v` is unchanged (`origin`, `github`). Nothing was pushed.
