@@ -56,6 +56,10 @@ early return never swallows them.
 
 A closed or merged PR is checked once and reported, not waited on: it will not
 get another review.
+
+On github.com (--provider github, or a checkout whose remote is there) only CI
+is watched, by github_ci.py: review-bot is not on GitHub yet. A CI pass there
+exits 11 CI_PASSED, never 0: nobody reviewed the PR.
 """
 
 from __future__ import annotations
@@ -114,6 +118,9 @@ CI_QUEUED_THRESHOLD_S = 5 * 60
 # seconds ago. Dating the grace off the commit would read that head as
 # long-settled and put the race straight back.
 CI_NONE_GRACE_S = 90
+# Gitea's mergeable=false also means a recomputation is still in progress.
+# A single false during a wait is not proof of a lasting merge block.
+MERGE_CHECK_GRACE_S = 90
 
 # Terminal issue-comment markers, straight from review_agent/worker.py.
 SKIP_MARKER = "This PR's diff is too large"
@@ -592,7 +599,10 @@ def decide(
 
 
 EXIT = {"REVIEWED": 0, "TIMED_OUT": 2, "FAILED": 3, "SKIPPED": 4, "STALE": 5,
-        "DECLINED": 6, "PENDING": 7, "CI_FAILED": 8}
+        "DECLINED": 6, "PENDING": 7, "CI_FAILED": 8,
+        "BASE_MOVED": 9, "NOT_MERGEABLE": 10,
+        # GitHub only: CI passed, and no review was watched.
+        "CI_PASSED": 11}
 EXIT_UNREACHABLE = 1
 
 
@@ -601,6 +611,10 @@ def exit_code(action: str, review_state: str) -> int:
 
     PENDING and CI_FAILED used to borrow 2 and 5, so one number meant
     TIMED_OUT, "did not wait" or "CI failed first" depending on the banner."""
+    if action == "base_moved":
+        return EXIT["BASE_MOVED"]
+    if action == "not_mergeable":
+        return EXIT["NOT_MERGEABLE"]
     if action == "timed_out":
         return EXIT["TIMED_OUT"]
     if action == "stale":
@@ -861,6 +875,14 @@ def remote_repos(remotes: str, base_url: str, prefer: tuple[str, ...] = ()) -> l
     Order: the `prefer` remotes (the branch's tracking remote), then `origin`,
     then the rest as git lists them. git sorts remotes by name, so taking the
     first match picked a `fork` remote over `origin`."""
+    by_remote = remotes_by_name(remotes, base_url)
+    ranked = [n for n in (*prefer, "origin") if n in by_remote]
+    ranked += [n for n in by_remote if n not in ranked]
+    return list(dict.fromkeys(by_remote[n] for n in ranked))
+
+
+def remotes_by_name(remotes: str, base_url: str) -> dict[str, str]:
+    """Remote name -> owner/name, for each remote on base_url's host."""
     host = urllib.parse.urlsplit(base_url).hostname or base_url.split("://", 1)[-1]
     pattern = rf"(?<![\w.-]){re.escape(host)}(?::\d+)?[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$"
     by_remote: dict[str, str] = {}
@@ -869,9 +891,41 @@ def remote_repos(remotes: str, base_url: str, prefer: tuple[str, ...] = ()) -> l
         url = rest.rsplit(" (", 1)[0].strip()
         if name not in by_remote and (m := re.search(pattern, url)):
             by_remote[name] = m.group(1)
-    ranked = [n for n in (*prefer, "origin") if n in by_remote]
-    ranked += [n for n in by_remote if n not in ranked]
-    return list(dict.fromkeys(by_remote[n] for n in ranked))
+    return by_remote
+
+
+GITHUB_URL = "https://github.com"
+
+
+def choose_provider(remotes: str | None, tracking: str | None, repo: str | None) -> str:
+    """`--provider auto`: which host this run is about, from the checkout.
+
+    Outside a checkout it is Gitea, as it always was. With `--repo`, the
+    provider whose remotes carry that repo; neither is Gitea, both is refused.
+    Otherwise the tracking remote's host, then origin's, then the only
+    provider any remote is on. Guessing between two would send one host's
+    PR number to the other."""
+    if remotes is None:
+        return "gitea"
+    by = {"gitea": remotes_by_name(remotes, BASE_URL),
+          "github": remotes_by_name(remotes, GITHUB_URL)}
+    both = "ambiguous: the checkout has remotes on Gitea and github.com"
+    if repo:
+        hits = [p for p, named in by.items() if repo in named.values()]
+        if len(hits) > 1:
+            sys.exit(f"{both} for {repo}: pass --provider gitea or --provider github")
+        return hits[0] if hits else "gitea"
+    for remote in (tracking, "origin"):
+        if found := [p for p, named in by.items() if remote in named]:
+            return found[0]
+    present = [p for p, named in by.items() if named]
+    if len(present) == 1:
+        return present[0]
+    if present:
+        sys.exit(f"{both}, and neither the tracking remote nor origin decides: "
+                 "pass --provider gitea or --provider github")
+    sys.exit(f"no remote on {BASE_URL} or {GITHUB_URL} found: pass --repo owner/name "
+             "--pr N, and --provider for github.com")
 
 
 def repo_from_remotes(remotes: str, base_url: str) -> str | None:
@@ -1110,7 +1164,7 @@ def next_steps(
             "CI settled first. No review has landed for this head yet: PENDING "
             "means \"nothing yet\". It is NOT a pass."
         )
-    elif state == "PENDING":
+    elif state == "PENDING" and action not in ("base_moved", "not_mergeable"):
         why = (
             "the PR is closed, so no review is coming"
             if closed
@@ -1183,6 +1237,8 @@ def next_steps(
                 f"CI has not settled ({ci.state}). Do not merge on the assumption "
                 "it passed."
             )
+        elif action in ("base_moved", "not_mergeable"):
+            steps.append(f"CI is still {ci.state}; it does not attest to the current combined tree.")
         elif action == "once":
             how = "check the run directly" if closed else "check the run, or re-run without --once"
             steps.append(
@@ -1261,6 +1317,61 @@ class HeadWatch:
         return cls(head, head_commit_date(repo, head, tok), now + timeout_s, now)
 
 
+def target_branch(pr: dict, repo: str, tok: str) -> tuple[str, str, str]:
+    """Read the live target tip, not the PR's possibly cached base SHA."""
+    base = pr.get("base") or {}
+    name = (base.get("repo") or {}).get("full_name") or repo
+    ref = base.get("ref")
+    if not isinstance(ref, str) or not ref:
+        raise ValueError("PR has no target branch; cannot check merge readiness")
+    branch = api(f"/repos/{name}/branches/{urllib.parse.quote(ref, safe='')}", tok)
+    sha = (branch.get("commit") or {}).get("id")
+    if not isinstance(sha, str) or not sha:
+        raise ValueError("target branch has no commit id; cannot check merge readiness")
+    return name, ref, sha
+
+
+def read_target(pr: dict, repo: str, tok: str) -> tuple[str, str, str] | None:
+    """A missing or inaccessible branch blocks readiness, not review/CI."""
+    if pr.get("state") == "closed":
+        return None
+    try:
+        return target_branch(pr, repo, tok)
+    except ValueError:
+        return None
+    except urllib.error.HTTPError:
+        # A missing or forbidden branch is unknown, not a reason to lose the
+        # independent review and CI verdicts.
+        return None
+    except Exception as exc:
+        if is_transient(exc):
+            return None
+        raise
+
+
+def render_readiness(pr: dict, target: tuple[str, str, str] | None, *, moved: bool) -> list[str]:
+    """Keep merge readiness separate from review and head-SHA CI."""
+    if pr.get("state") == "closed":
+        print("Merge readiness: NOT APPLICABLE (PR closed)")
+        return []
+    mergeable = pr.get("mergeable")
+    label = "YES" if mergeable is True else "NO" if mergeable is False else "UNKNOWN"
+    tip = f"{target[0]}:{target[1]} @ {target[2][:8]}" if target else "target tip UNKNOWN"
+    print(f"Merge readiness: {label} | {tip}")
+    if moved:
+        print("  Target moved during this wait: earlier review/CI did not test the new combined tree.")
+    if not target:
+        return ["Target branch could not be read. Do not merge until its live tip and mergeability can be checked."]
+    if mergeable is False:
+        return ["Gitea reports this PR NOT MERGEABLE right now (checking, draft, conflict, or other block). Check the reason and recheck before merging."]
+    if mergeable is not True:
+        return ["Mergeability is UNKNOWN; do not infer a pass. Retry the fresh PR check before merging."]
+    return ["Immediately before merging, refresh the PR and target tip and verify mergeability again. Head-SHA CI alone does not prove the new combined tree passes; update/rebase and rerun appropriate checks if the target moved. The merge API is the final atomic guard."]
+
+
+PROVIDERS = ("auto", "gitea", "github")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", help="owner/name (default: infer from git remote)")
@@ -1277,7 +1388,20 @@ def main(argv: list[str] | None = None) -> int:
                          "(implies --wait-for review)")
     ap.add_argument("--full", action="store_true",
                     help="keep the per-file Reviewed changes table in the body")
+    ap.add_argument("--provider", choices=PROVIDERS, default="auto",
+                    help="where the PR lives: gitea, github (CI only), or auto, "
+                         "from the checkout's remotes (default; Gitea outside a checkout)")
     args = ap.parse_args(argv)
+    provider = args.provider
+    if provider == "auto":
+        remotes = _git("remote", "-v")
+        branch = _git("rev-parse", "--abbrev-ref", "HEAD") if remotes is not None else None
+        tracking = _git("config", "--get", f"branch.{branch}.remote") if branch else None
+        provider = choose_provider(remotes, tracking, args.repo)
+    if provider == "github":
+        import github_ci
+
+        return github_ci.main(args)
     # A failed CI is a CI event, so under `any` --no-fail-fast would change
     # nothing. What it asks for is to wait for the review.
     wait_for = args.wait_for or ("review" if args.no_fail_fast else "any")
@@ -1301,6 +1425,9 @@ def main(argv: list[str] | None = None) -> int:
 
     pr = api(f"/repos/{repo}/pulls/{pr_num}", tok)
     head = pr["head"]["sha"]
+    target = read_target(pr, repo, tok)
+    if target is None and pr.get("state") != "closed":
+        print("  target tip unreadable; merge readiness unknown until rechecked")
     # NB: only the single-PR endpoint populates requested_reviewers. The list
     # endpoint returns [] for every PR, which reads as "nobody was asked".
     requested = BOT in [
@@ -1323,13 +1450,15 @@ def main(argv: list[str] | None = None) -> int:
         ci = read_ci(repo, head, tok, datetime.now(timezone.utc))
         render_ci(ci)
         declined = Verdict(state="DECLINED", detail="bot_authored_pr")
-        render_next(next_steps("done", declined, ci, watched_s=0, closed=closed))
+        readiness = render_readiness(pr, target, moved=False)
+        render_next(next_steps("done", declined, ci, watched_s=0, closed=closed) + readiness)
         return EXIT["DECLINED"]
 
     timeout_s = args.timeout_minutes * 60
     started = time.monotonic()
     watch = HeadWatch.start(repo, head, tok, timeout_s)
     last_progress: tuple[str, ...] = ()
+    false_since: float | None = None
     # Bot reviews already there on the first poll. Kept across head moves, not
     # in HeadWatch: one that lands later is news even when it is STALE, since
     # the bot reviewed a head since pushed past.
@@ -1339,13 +1468,18 @@ def main(argv: list[str] | None = None) -> int:
     # resolved status can change, which is refreshed before printing.
     inline: dict[int, list[dict]] = {}
     # How the reader re-runs this for the side still open, repo and PR pinned.
-    rerun = f"python3 {SCRIPT} --repo {repo} --pr {pr_num}"
+    rerun = f"python3 {SCRIPT} --provider gitea --repo {repo} --pr {pr_num}"
 
     while True:
         try:
             pr = api(f"/repos/{repo}/pulls/{pr_num}", tok)
             current = pr["head"]["sha"]
+            current_target = read_target(pr, repo, tok)
+            base_moved = target is not None and current_target is not None and current_target != target
+            if target is None and current_target is not None:
+                target = current_target
             if current != watch.head:
+                false_since = None
                 # A push landed mid-wait. A review anchored to the old SHA says
                 # nothing about what would now be merged, so restart the clock.
                 print(f"\n>> head moved {watch.head[:8]} -> {current[:8]}; restarting the wait")
@@ -1395,6 +1529,19 @@ def main(argv: list[str] | None = None) -> int:
                 ci_was_open=watch.ci_was_open,
                 clean=has_review and not inline[rid] and not verdict.notes,
             )
+            if pr.get("mergeable") is False:
+                if false_since is None:
+                    false_since = now
+            else:
+                false_since = None
+            if not closed:
+                if base_moved:
+                    action = "base_moved"
+                elif pr.get("mergeable") is False and (
+                    args.once or (false_since is not None and now - false_since >= MERGE_CHECK_GRACE_S)
+                ):
+                    # Gitea also returns false while checking mergeability.
+                    action = "not_mergeable"
             watch.ci_was_open |= not ci_settled(ci_verdict, now - watch.since)
             # Every action but waiting renders the verdict, and a REVIEWED or
             # STALE review's inline comments are the half a reader most needs.
@@ -1439,14 +1586,27 @@ def main(argv: list[str] | None = None) -> int:
                       f"{': ' + ci_verdict.detail if ci_verdict.detail else ''}")
             time.sleep(args.interval)
             continue
+        if base_moved:
+            print(f">> target moved {target[0]}:{target[1]} {target[2][:8]} -> {current_target[0]}:{current_target[1]} {current_target[2][:8]}")
         if action == "timed_out":
             report_timed_out(repo, pr_num, watch.head, waited, requested, ci_verdict)
         else:
             render(verdict, repo, pr_num, watch.head, waited, args.full)
             render_ci(ci_verdict)
-        render_next(next_steps(action, verdict, ci_verdict,
-                               watched_s=now - watch.since, closed=closed,
-                               rerun=rerun))
+        readiness = render_readiness(pr, current_target, moved=base_moved)
+        steps = next_steps(action, verdict, ci_verdict,
+                           watched_s=now - watch.since, closed=closed,
+                           rerun=rerun)
+        if action == "base_moved":
+            steps.insert(0, "BASE_MOVED: the target changed during this wait. Update/rebase if needed, run appropriate checks against the new base, and restart the poller.")
+        elif action == "not_mergeable":
+            steps.insert(0, "NOT_MERGEABLE: Gitea cannot merge this PR now. Inspect and clear the block; then rerun the poller.")
+        # For an early review/CI return, keep its wait command last.
+        if action in ("review", "ci") and steps and steps[-1].startswith("To keep waiting"):
+            steps[-1:-1] = readiness
+        else:
+            steps += readiness
+        render_next(steps)
         return exit_code(action, verdict.state)
 
 

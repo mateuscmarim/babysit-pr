@@ -1,6 +1,6 @@
 ---
 name: babysit-pr
-description: Use before merging a pull request on a Gitea instance. It waits for review-bot's automated review and the PR's CI, returns as soon as either one has news, and reports what each found. Triggers on "babysit this PR", "wait for the review", "is the bot done", "is CI green on this Gitea PR", or any merge of a Gitea PR opened while the reviewer is live.
+description: Use before merging a pull request on a Gitea instance or github.com. On Gitea it waits for review-bot's automated review and the PR's CI, returns as soon as either one has news, and reports what each found. On github.com it waits for CI only, since the bot is not there yet. Triggers on "babysit this PR", "wait for the review", "is the bot done", "is CI green on this Gitea PR", "wait for CI on this GitHub PR", or any merge of a Gitea PR opened while the reviewer is live.
 ---
 
 # Babysit a PR until the reviewer has spoken
@@ -22,8 +22,9 @@ python3 ~/.claude/skills/babysit-pr/scripts/poll_review.py > /tmp/babysit-REPO-P
 Use the Bash tool's `run_in_background: true`: the wait runs up to 35
 minutes, and you are notified when it exits. It exits at the first of: the
 review decides (a review, a skip or failure notice, a decline), a new bot
-review lands (even one of an older head), or CI finishes. A review with no
-findings is the exception: it waits for CI, since there is nothing to act on
+review lands (even one of an older head), CI finishes, the target branch moves,
+or Gitea persistently reports the PR is not mergeable. A review with no findings
+is the exception: it waits for CI, since there is nothing to act on
 before CI answers. After starting it, **end your
 turn** and wait for that notification. Don't monitor, poll or `tail -f` the
 file, and don't make placeholder calls (`echo waiting`, `true`, `sleep`) to
@@ -33,6 +34,15 @@ without waiting and can run in the foreground.
 Repo and PR are inferred from the checkout. Pass `--repo owner/name --pr N`
 from anywhere else. Other flags, the environment variables and live-output
 tips are in [references/setup.md](references/setup.md).
+
+## GitHub: CI only
+
+On a github.com PR the poller watches CI and merge readiness, not a review:
+review-bot is not on GitHub yet. The provider comes from the checkout's
+remotes; outside a checkout it is Gitea, so pass `--provider github`. The
+header says `review: NOT_MONITORED`. A CI pass exits 11 `CI_PASSED`, which is
+**not a review** and not a merge approval. `--wait-for review` or `both`,
+`--no-fail-fast`, `--full` and the Gitea CI filters are refused there.
 
 ## Read the result
 
@@ -52,10 +62,18 @@ on what came back first, then start that command the same way. The exit code tel
 | 6 | `DECLINED` | no review is coming, for the reason printed |
 | 7 | `PENDING` | CI finished first, `--once`, or a closed PR: no review yet. **Not a pass** |
 | 8 | `CI_FAILED` | CI failed before the review decided |
+| 9 | `BASE_MOVED` | the target branch advanced during this wait; check the new combined tree |
+| 10 | `NOT_MERGEABLE` | Gitea reports `mergeable: false` after a grace period (or under `--once`); it could still be checking, draft, or blocked |
+| 11 | `CI_PASSED` | GitHub only: every check at the head succeeded. **Not a review**, and no reviewer was watched |
 
-The code is the review's. CI is reported in its own block, and a failed or
-still-running CI next to exit 0 appears as its own step under NEXT. Exit 0
-with CI still running is not a merge signal.
+On Gitea, except for 9 and 10, the code is the review's. On GitHub it is
+CI's: 11, 8, 7 or 2, or 9 and 10 for readiness. CI and merge readiness have
+their own blocks. Exit 0 is not a merge signal if CI is open or Gitea's
+mergeability is unknown. **Immediately before merging**, refresh the PR and
+target tip, check mergeability again, and ensure the right checks cover the
+current combined tree. If the target moved, update or rebase and rerun the
+appropriate checks. The merge API is the final guard against a last-second
+change.
 
 Three rules the output cannot enforce:
 
@@ -78,5 +96,5 @@ Run the tests after any change, and read [HISTORY.md](HISTORY.md) before
 loosening a rule. It holds the incidents behind each one.
 
 ```bash
-cd ~/.claude/skills/babysit-pr/scripts && python3 test_poll_review.py && python3 test_reply_finding.py
+cd ~/.claude/skills/babysit-pr/scripts && python3 test_poll_review.py && python3 test_github_ci.py && python3 test_reply_finding.py
 ```

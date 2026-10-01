@@ -2,8 +2,12 @@
 
 A Claude Code skill. Waits for `review-bot` (the `gitea-review-agent` companion
 project) to review a PR on your Gitea instance and for that PR's CI to reach a
-final state. It returns as soon as **either** has news, reports what each
-found, and says how to wait for the one still open.
+final state. It returns as soon as **either** has news, or when the target
+branch moves or Gitea persistently reports the PR as unmergeable. It reports what each check found and says what to
+do next.
+
+On github.com it watches **CI only** for now, because the bot is still being
+ported there. See [GitHub: CI only](#github-ci-only).
 
 It exists because the bot cannot block a merge: `build_review_payload`
 hardcodes `"event": "COMMENT"`, never `APPROVE` or `REQUEST_CHANGES`, so branch
@@ -18,15 +22,15 @@ contract in `references/replying.md`, each read only when needed.
 
 ## The flow
 
-The review and CI are two independent verdicts. One loop polls both, and
-neither waits on the other. By default (`--wait-for any`) the loop returns on
-whichever side has news first, so the reader can act on a finding while CI is
+Review, CI, and merge readiness are separate checks. One loop polls all three,
+and neither review nor CI waits on the other. By default (`--wait-for any`),
+the loop returns on whichever side has news first, so the reader can act on a finding while CI is
 still running, or fix a red CI before the review lands. `--wait-for review`,
 `ci` or `both` narrow that; `both` is the old "return only once both settled".
 
 ```mermaid
 flowchart TD
-    A(["poll_review.py"]) --> B["resolve repo + PR, read head SHA"]
+    A(["poll_review.py"]) --> B["resolve repo + PR, read head and live target SHA"]
     B --> C{"PR authored by review-bot?"}
     C -->|yes| CX(["DECLINED · exit 6<br/>parse_event skips these to avoid loops"])
     C -->|no| CL{"PR closed or merged?"}
@@ -45,7 +49,10 @@ flowchart TD
 
     G["classify → review verdict<br/>newest bot review at head wins<br/>REVIEWED · STALE · SKIPPED<br/>FAILED · DECLINED · PENDING"]
     G --> H["read_ci → CI verdict<br/>newest run per workflow + event<br/>PASSED · FAILED · RUNNING<br/>UNKNOWN · NONE"]
-    H --> I{"review decided<br/>AND ci_settled?"}
+    H --> T{"target moved or<br/>mergeable false for 90s?"}
+    T -->|"false persisted / --once"| TX(["NOT_MERGEABLE · exit 10<br/>may be checking, draft, or blocked"])
+    T -->|"target moved"| TY(["BASE_MOVED · exit 9<br/>recheck combined tree"])
+    T -->|no| I{"review decided<br/>AND ci_settled?"}
 
     I -->|yes| IX(["the review's own exit code<br/>REVIEWED 0 · FAILED 3<br/>SKIPPED 4 · DECLINED 6"])
     I -->|no| J{"--once or PR closed?"}
@@ -69,7 +76,7 @@ flowchart TD
     I -.- Z["ci_settled: RUNNING never settles.<br/>PASSED and FAILED settle at once.<br/>UNKNOWN settles only on a 4xx;<br/>a transport error holds the wait.<br/>NONE only after 90s watching this head,<br/>since Gitea may not have created the run yet."]
 ```
 
-Six things this shape depends on:
+Seven things this shape depends on:
 
 - **Control comes back on the first news, not the last.** Waiting for both
   sides held a bot failure posted at 32s until CI finished at 2184s. Each early
@@ -77,9 +84,16 @@ Six things this shape depends on:
   had already passed when the run began, a STALE review that was already
   there, and a review with no findings are not news: returning on them would
   send the reader straight back.
-- **Once the review decides, the code is the review's.** CI gets its own
-  block. `PASSED` CI next to a `FAILED` review is still exit 3, and a failed
-  CI next to a `REVIEWED` is still 0, so read both blocks, not the number.
+- **Once the review decides, the code is the review's, unless merge readiness
+  blocks it.** CI and mergeability get their own blocks. A target movement or
+  unmergeable PR returns with exit 9 or 10, even if review and CI passed. An
+  unknown mergeability result is not an all-clear. Immediately before merging,
+  refresh the PR and target tip; head-SHA CI alone cannot prove the combined
+  tree passes.
+- **CI does not change the review's code.** CI gets its own block. `PASSED` CI
+  next to a `FAILED` review is still exit 3, and failed CI next to a `REVIEWED`
+  review is still 0 when merge readiness does not override it,
+  so read all blocks, not just the number.
 - **`TIMED_OUT` is the last branch, not the default.** The decline paths now
   report as `DECLINED` with a reason, and a Gitea outage reports as
   `UNREACHABLE`. Reaching `TIMED_OUT` means none of them applied.
@@ -93,7 +107,34 @@ Six things this shape depends on:
 - **The output says what to do next.** Every exit path ends with a `>> NEXT:`
   block written for that result: verify these findings, fix CI first, this
   is not a pass. The reader follows the step in front of it instead of
-  keeping a table of nine codes in mind through a 35-minute wait.
+  keeping a table of codes in mind through a 35-minute wait.
+
+## GitHub: CI only
+
+`scripts/github_ci.py` handles a PR on github.com. `poll_review.py` hands off
+to it when `--provider github` is passed, or when `--provider auto` (the
+default) finds the checkout's tracking remote, or else `origin`, on
+github.com. Outside a checkout the default stays Gitea.
+
+- **No review is watched.** The header and the report say
+  `review: NOT_MONITORED`, and review-only options (`--wait-for review` or
+  `both`, `--no-fail-fast`, `--full`) are refused, as are `CI_WORKFLOW_FILE`
+  and `CI_JOB_NAME`.
+- **CI is every check run and commit status at the head**, newest per check
+  (application, name and check suite) and per status context, read page by
+  page. A re-run replaces a run only within its own suite, so a failing
+  `build` in one workflow is never hidden by a passing `build` in another. There is
+  no filter, and branch protection is not evaluated.
+- **A pass is `CI_PASSED`, exit 11.** It is not a review and never exit 0,
+  which means a reviewed PR. No checks at all is not a pass: it waits and
+  then exits 2 `TIMED_OUT`. CI that cannot be read is `UNKNOWN`, and exits 1
+  if it stays that way.
+- **Merge readiness works as on Gitea.** A moved target exits 9 and a
+  `mergeable: false` held for 90 seconds exits 10.
+- **The token stays on api.github.com.** It comes from `GH_TOKEN`, then
+  `GITHUB_TOKEN`, then `gh auth token --hostname github.com`. Every request is
+  a GET, pagination never follows a URL from a `link` header, and a redirect
+  to another host is refused.
 
 ## This repo *is* the installed skill
 
@@ -116,12 +157,20 @@ Repo and PR are inferred from the current checkout's Gitea remote (set
 owner/name --pr N`. Needs a Gitea token from `$GITEA_TOKEN`, or from the `tea`
 login whose url matches `GITEA_BASE_URL`. No credentials are stored here.
 
+For a github.com PR from outside its checkout:
+
+```bash
+python3 ~/.claude/skills/babysit-pr/scripts/poll_review.py --provider github --repo owner/name --pr N
+```
+
 ## Tests
 
 Plain Python, no pytest, so they run anywhere the skill runs. A failing check
 is reported without stopping the run. `main()` runs end to end against a fake
-Gitea and a fake clock. Required after any change:
+Gitea (or GitHub) and a fake clock. `test_github_ci.py -k C5:` runs the
+section for one check in `.specs/features/github-ci/checks.md`. Required
+after any change:
 
 ```bash
-cd scripts && python3 test_poll_review.py && python3 test_reply_finding.py
+cd scripts && python3 test_poll_review.py && python3 test_github_ci.py && python3 test_reply_finding.py
 ```
