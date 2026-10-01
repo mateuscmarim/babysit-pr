@@ -398,6 +398,54 @@ def _():
     ok("detached HEAD -> exit 1 without asking GitHub",
        isinstance(got, str) and got.startswith("exit 1") and not calls, got)
 
+    # End to end: an explicit --repo is where to look, never a head source.
+    # The only checkout remote is the fork me/r; o/r is named on the command
+    # line and also has its own same-named `feat` branch open as PR 5.
+    def git(*a):
+        if a[:2] == ("remote", "-v"):
+            return "fork\thttps://github.com/me/r.git (fetch)\nfork\thttps://github.com/me/r.git (push)\n"
+        if a[:1] == ("rev-parse",):
+            return "feat"
+        return "fork" if a[:2] == ("config", "--get") else None
+
+    def explicit_repo(prs):
+        fake = FakeGitHub()
+
+        calls = []
+
+        def api(path, tok):
+            calls.append(path)
+            base, _, query = path.partition("?")
+            if base == "/repos/o/r/pulls":
+                q = dict(urllib.parse.parse_qsl(query))
+                return (prs if q.get("page", "1") == "1" else []), {}
+            return fake(path, tok)
+
+        buf = io.StringIO()
+        with patched(github_ci, api=api, time=FakeClock(), github_token=lambda: TOKEN), \
+                patched(poll_review, token=forbidden("gitea token()"), _git=git,
+                        CI_WORKFLOW_FILE=None, CI_JOB_NAME=None), \
+                contextlib.redirect_stdout(buf):
+            try:
+                got = poll_review.main(["--provider", "github", "--repo", "o/r", "--once"])
+            except SystemExit as exc:
+                got = f"exit {status_of(exc)}: {exc.code}"
+            except AssertionError as exc:  # FakeGitHub serves PR 7 only
+                got = f"error: {exc}"
+        return got, calls
+
+    got, calls = explicit_repo([pull(5, "o/r")])
+    ok("explicit --repo, only its own same-named PR open -> ignored, exit 1",
+       isinstance(got, str) and got.startswith("exit 1") and "--pr" in got
+       and "/repos/o/r/pulls/5" not in calls, (got, calls))
+    ok("  asks only for heads owned by checkout remotes",
+       calls and all("head=me%3Afeat" in c for c in calls if "/pulls?" in c), calls)
+
+    got, calls = explicit_repo([pull(5, "o/r"), pull(7, "me/r")])
+    check("explicit --repo, its own PR beside the fork PR -> the fork PR, no ambiguity", got, 11)
+    ok("  watches PR 7, never PR 5",
+       "/repos/o/r/pulls/7" in calls and "/repos/o/r/pulls/5" not in calls, calls)
+
 
 @section("C4: review options are rejected on GitHub")
 def _():

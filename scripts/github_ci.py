@@ -523,7 +523,9 @@ def resolve(args, tok: str) -> tuple[str, int]:
         sys.exit(f"no {HOST} remote found: pass --repo owner/name --pr N")
     if args.pr:
         return repos[0], args.pr
-    return infer_pr(repos, list(dict.fromkeys([*repos, *ours])), branch, tok)
+    # Heads come from checkout remotes only: an explicit --repo is where to
+    # look, not a source of this branch.
+    return infer_pr(repos, ours, branch, tok)
 
 
 def main(args) -> int:
