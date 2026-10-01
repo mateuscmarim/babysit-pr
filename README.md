@@ -6,6 +6,9 @@ final state. It returns as soon as **either** has news, or when the target
 branch moves or Gitea persistently reports the PR as unmergeable. It reports what each check found and says what to
 do next.
 
+On github.com it watches **CI only** for now, because the bot is still being
+ported there. See [GitHub: CI only](#github-ci-only).
+
 It exists because the bot cannot block a merge: `build_review_payload`
 hardcodes `"event": "COMMENT"`, never `APPROVE` or `REQUEST_CHANGES`, so branch
 protection has nothing to gate on. A review can take ~30 minutes and routinely
@@ -106,6 +109,33 @@ Seven things this shape depends on:
   is not a pass. The reader follows the step in front of it instead of
   keeping a table of codes in mind through a 35-minute wait.
 
+## GitHub: CI only
+
+`scripts/github_ci.py` handles a PR on github.com. `poll_review.py` hands off
+to it when `--provider github` is passed, or when `--provider auto` (the
+default) finds the checkout's tracking remote, or else `origin`, on
+github.com. Outside a checkout the default stays Gitea.
+
+- **No review is watched.** The header and the report say
+  `review: NOT_MONITORED`, and review-only options (`--wait-for review` or
+  `both`, `--no-fail-fast`, `--full`) are refused, as are `CI_WORKFLOW_FILE`
+  and `CI_JOB_NAME`.
+- **CI is every check run and commit status at the head**, newest per check
+  (application, name and check suite) and per status context, read page by
+  page. A re-run replaces a run only within its own suite, so a failing
+  `build` in one workflow is never hidden by a passing `build` in another. There is
+  no filter, and branch protection is not evaluated.
+- **A pass is `CI_PASSED`, exit 11.** It is not a review and never exit 0,
+  which means a reviewed PR. No checks at all is not a pass: it waits and
+  then exits 2 `TIMED_OUT`. CI that cannot be read is `UNKNOWN`, and exits 1
+  if it stays that way.
+- **Merge readiness works as on Gitea.** A moved target exits 9 and a
+  `mergeable: false` held for 90 seconds exits 10.
+- **The token stays on api.github.com.** It comes from `GH_TOKEN`, then
+  `GITHUB_TOKEN`, then `gh auth token --hostname github.com`. Every request is
+  a GET, pagination never follows a URL from a `link` header, and a redirect
+  to another host is refused.
+
 ## This repo *is* the installed skill
 
 It is `git init`-ed in place at `~/.claude/skills/babysit-pr`, so there is no
@@ -127,12 +157,20 @@ Repo and PR are inferred from the current checkout's Gitea remote (set
 owner/name --pr N`. Needs a Gitea token from `$GITEA_TOKEN`, or from the `tea`
 login whose url matches `GITEA_BASE_URL`. No credentials are stored here.
 
+For a github.com PR from outside its checkout:
+
+```bash
+python3 ~/.claude/skills/babysit-pr/scripts/poll_review.py --provider github --repo owner/name --pr N
+```
+
 ## Tests
 
 Plain Python, no pytest, so they run anywhere the skill runs. A failing check
 is reported without stopping the run. `main()` runs end to end against a fake
-Gitea and a fake clock. Required after any change:
+Gitea (or GitHub) and a fake clock. `test_github_ci.py -k C5:` runs the
+section for one check in `.specs/features/github-ci/checks.md`. Required
+after any change:
 
 ```bash
-cd scripts && python3 test_poll_review.py && python3 test_reply_finding.py
+cd scripts && python3 test_poll_review.py && python3 test_github_ci.py && python3 test_reply_finding.py
 ```

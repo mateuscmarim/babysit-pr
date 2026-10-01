@@ -1033,7 +1033,9 @@ def run_main(gitea, *args, agent=None):
     buf = io.StringIO()
     # --once sets the module's API limits for the rest of the process. Patching
     # them to their own values restores them, so the next test starts clean.
-    with patched(poll_review, api=gitea, time=clock, token=lambda: "t",
+    # No git: `--provider auto` would otherwise read this checkout's remotes and
+    # could route --repo o/r to github.com. Outside a checkout it is Gitea.
+    with patched(poll_review, api=gitea, time=clock, token=lambda: "t", _git=lambda *a: None,
                  agent_state=lambda repo, pr, sha: agent, health=lambda: "up (test)",
                  API_TIMEOUT_S=poll_review.API_TIMEOUT_S, API_RETRIES=poll_review.API_RETRIES), \
             contextlib.redirect_stdout(buf):

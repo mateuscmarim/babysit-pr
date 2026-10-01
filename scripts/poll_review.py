@@ -56,6 +56,10 @@ early return never swallows them.
 
 A closed or merged PR is checked once and reported, not waited on: it will not
 get another review.
+
+On github.com (--provider github, or a checkout whose remote is there) only CI
+is watched, by github_ci.py: review-bot is not on GitHub yet. A CI pass there
+exits 11 CI_PASSED, never 0: nobody reviewed the PR.
 """
 
 from __future__ import annotations
@@ -596,7 +600,9 @@ def decide(
 
 EXIT = {"REVIEWED": 0, "TIMED_OUT": 2, "FAILED": 3, "SKIPPED": 4, "STALE": 5,
         "DECLINED": 6, "PENDING": 7, "CI_FAILED": 8,
-        "BASE_MOVED": 9, "NOT_MERGEABLE": 10}
+        "BASE_MOVED": 9, "NOT_MERGEABLE": 10,
+        # GitHub only: CI passed, and no review was watched.
+        "CI_PASSED": 11}
 EXIT_UNREACHABLE = 1
 
 
@@ -869,6 +875,14 @@ def remote_repos(remotes: str, base_url: str, prefer: tuple[str, ...] = ()) -> l
     Order: the `prefer` remotes (the branch's tracking remote), then `origin`,
     then the rest as git lists them. git sorts remotes by name, so taking the
     first match picked a `fork` remote over `origin`."""
+    by_remote = remotes_by_name(remotes, base_url)
+    ranked = [n for n in (*prefer, "origin") if n in by_remote]
+    ranked += [n for n in by_remote if n not in ranked]
+    return list(dict.fromkeys(by_remote[n] for n in ranked))
+
+
+def remotes_by_name(remotes: str, base_url: str) -> dict[str, str]:
+    """Remote name -> owner/name, for each remote on base_url's host."""
     host = urllib.parse.urlsplit(base_url).hostname or base_url.split("://", 1)[-1]
     pattern = rf"(?<![\w.-]){re.escape(host)}(?::\d+)?[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$"
     by_remote: dict[str, str] = {}
@@ -877,9 +891,41 @@ def remote_repos(remotes: str, base_url: str, prefer: tuple[str, ...] = ()) -> l
         url = rest.rsplit(" (", 1)[0].strip()
         if name not in by_remote and (m := re.search(pattern, url)):
             by_remote[name] = m.group(1)
-    ranked = [n for n in (*prefer, "origin") if n in by_remote]
-    ranked += [n for n in by_remote if n not in ranked]
-    return list(dict.fromkeys(by_remote[n] for n in ranked))
+    return by_remote
+
+
+GITHUB_URL = "https://github.com"
+
+
+def choose_provider(remotes: str | None, tracking: str | None, repo: str | None) -> str:
+    """`--provider auto`: which host this run is about, from the checkout.
+
+    Outside a checkout it is Gitea, as it always was. With `--repo`, the
+    provider whose remotes carry that repo; neither is Gitea, both is refused.
+    Otherwise the tracking remote's host, then origin's, then the only
+    provider any remote is on. Guessing between two would send one host's
+    PR number to the other."""
+    if remotes is None:
+        return "gitea"
+    by = {"gitea": remotes_by_name(remotes, BASE_URL),
+          "github": remotes_by_name(remotes, GITHUB_URL)}
+    both = "ambiguous: the checkout has remotes on Gitea and github.com"
+    if repo:
+        hits = [p for p, named in by.items() if repo in named.values()]
+        if len(hits) > 1:
+            sys.exit(f"{both} for {repo}: pass --provider gitea or --provider github")
+        return hits[0] if hits else "gitea"
+    for remote in (tracking, "origin"):
+        if found := [p for p, named in by.items() if remote in named]:
+            return found[0]
+    present = [p for p, named in by.items() if named]
+    if len(present) == 1:
+        return present[0]
+    if present:
+        sys.exit(f"{both}, and neither the tracking remote nor origin decides: "
+                 "pass --provider gitea or --provider github")
+    sys.exit(f"no remote on {BASE_URL} or {GITHUB_URL} found: pass --repo owner/name "
+             "--pr N, and --provider for github.com")
 
 
 def repo_from_remotes(remotes: str, base_url: str) -> str | None:
@@ -1323,6 +1369,9 @@ def render_readiness(pr: dict, target: tuple[str, str, str] | None, *, moved: bo
     return ["Immediately before merging, refresh the PR and target tip and verify mergeability again. Head-SHA CI alone does not prove the new combined tree passes; update/rebase and rerun appropriate checks if the target moved. The merge API is the final atomic guard."]
 
 
+PROVIDERS = ("auto", "gitea", "github")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", help="owner/name (default: infer from git remote)")
@@ -1339,7 +1388,20 @@ def main(argv: list[str] | None = None) -> int:
                          "(implies --wait-for review)")
     ap.add_argument("--full", action="store_true",
                     help="keep the per-file Reviewed changes table in the body")
+    ap.add_argument("--provider", choices=PROVIDERS, default="auto",
+                    help="where the PR lives: gitea, github (CI only), or auto, "
+                         "from the checkout's remotes (default; Gitea outside a checkout)")
     args = ap.parse_args(argv)
+    provider = args.provider
+    if provider == "auto":
+        remotes = _git("remote", "-v")
+        branch = _git("rev-parse", "--abbrev-ref", "HEAD") if remotes is not None else None
+        tracking = _git("config", "--get", f"branch.{branch}.remote") if branch else None
+        provider = choose_provider(remotes, tracking, args.repo)
+    if provider == "github":
+        import github_ci
+
+        return github_ci.main(args)
     # A failed CI is a CI event, so under `any` --no-fail-fast would change
     # nothing. What it asks for is to wait for the review.
     wait_for = args.wait_for or ("review" if args.no_fail_fast else "any")
@@ -1406,7 +1468,7 @@ def main(argv: list[str] | None = None) -> int:
     # resolved status can change, which is refreshed before printing.
     inline: dict[int, list[dict]] = {}
     # How the reader re-runs this for the side still open, repo and PR pinned.
-    rerun = f"python3 {SCRIPT} --repo {repo} --pr {pr_num}"
+    rerun = f"python3 {SCRIPT} --provider gitea --repo {repo} --pr {pr_num}"
 
     while True:
         try:
